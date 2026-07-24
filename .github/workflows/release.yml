@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "*-base-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+          cache: true
+      - name: Resolve release coordinates
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          plugin="${tag%-v*}"
+          version="${tag#${plugin}-v}"
+          case "$plugin" in
+            system-base|storage-base|systemd-base|docker-base) ;;
+            *) echo "unsupported plugin tag: $tag" >&2; exit 1 ;;
+          esac
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "PLUGIN=$plugin" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - name: Test
+        run: go test -race ./...
+      - name: Build static binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${GITHUB_SHA} -X main.buildDate=${BUILD_DATE}" \
+            -o "dist/${PLUGIN}_linux_amd64" "./cmd/${PLUGIN}"
+          file "dist/${PLUGIN}_linux_amd64" | grep -q "statically linked"
+          "dist/${PLUGIN}_linux_amd64" manifest --protocol=1 | go run ./tools/manifestcheck
+          sha256sum "dist/${PLUGIN}_linux_amd64" > "dist/${PLUGIN}_linux_amd64.sha256"
+      - uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: v1.44.0
+      - name: Generate SPDX SBOM
+        shell: bash
+        run: syft "file:dist/${PLUGIN}_linux_amd64" -o "spdx-json=dist/${PLUGIN}_linux_amd64.spdx.json"
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/${{ env.PLUGIN }}_linux_amd64
+            dist/${{ env.PLUGIN }}_linux_amd64.sha256
+            dist/${{ env.PLUGIN }}_linux_amd64.spdx.json
