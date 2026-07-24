@@ -13,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.0"
           cache: true
@@ -46,13 +46,13 @@ jobs:
           file "dist/${PLUGIN}_linux_amd64" | grep -q "statically linked"
           "dist/${PLUGIN}_linux_amd64" manifest --protocol=1 | go run ./tools/manifestcheck
           sha256sum "dist/${PLUGIN}_linux_amd64" > "dist/${PLUGIN}_linux_amd64.sha256"
-      - uses: anchore/sbom-action/download-syft@v0
+      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           syft-version: v1.44.0
       - name: Generate SPDX SBOM
         shell: bash
         run: syft "file:dist/${PLUGIN}_linux_amd64" -o "spdx-json=dist/${PLUGIN}_linux_amd64.spdx.json"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           fail_on_unmatched_files: true
