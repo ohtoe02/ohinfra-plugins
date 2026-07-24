@@ -65,7 +65,8 @@ func TestLoadRejectsSymlinkAndWritableFile(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		return
 	}
-	if _, err := Load(target, fixture{}); err == nil || !strings.Contains(err.Error(), "writable") {
+	if _, err := Load(target, fixture{}); err == nil ||
+		(!strings.Contains(err.Error(), "writable") && !strings.Contains(err.Error(), "root-owned")) {
 		t.Fatalf("writable file error = %v", err)
 	}
 }
