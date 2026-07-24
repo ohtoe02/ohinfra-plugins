@@ -17,7 +17,9 @@ jobs:
         with:
           go-version: "1.26.0"
           cache: true
-      - run: gofmt -l . | tee /tmp/gofmt.out && test ! -s /tmp/gofmt.out
+      - run: |
+          gofmt -l . | tee /tmp/gofmt.out
+          test ! -s /tmp/gofmt.out
       - run: go vet ./...
       - run: go test -race -coverprofile=coverage.out ./...
 
@@ -36,5 +38,7 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64
           go build -trimpath -o "${{ matrix.plugin }}_linux_amd64"
           "./cmd/${{ matrix.plugin }}"
-      - run: file "${{ matrix.plugin }}_linux_amd64" | grep -q "statically linked"
-      - run: "./${{ matrix.plugin }}_linux_amd64" manifest --protocol=1 | go run ./tools/manifestcheck
+      - run: |
+          file "${{ matrix.plugin }}_linux_amd64" | grep -q "statically linked"
+      - run: |
+          "./${{ matrix.plugin }}_linux_amd64" manifest --protocol=1 | go run ./tools/manifestcheck
