@@ -11,6 +11,21 @@ import (
 	"time"
 )
 
+func TestMain(m *testing.M) {
+	switch os.Getenv("GO_WANT_EXECX_HELPER") {
+	case "output":
+		_, _ = os.Stdout.WriteString(strings.Repeat("o", 128))
+		_, _ = os.Stderr.WriteString(strings.Repeat("e", 128))
+		os.Exit(0)
+	case "sleep":
+		time.Sleep(5 * time.Second)
+		os.Exit(0)
+	case "exit":
+		os.Exit(23)
+	}
+	os.Exit(m.Run())
+}
+
 func TestResolverIgnoresPoisonedPATHAndRejectsPathInput(t *testing.T) {
 	trusted := t.TempDir()
 	poisoned := t.TempDir()
@@ -87,20 +102,6 @@ func TestResolverReportsMissingTrustedExecutable(t *testing.T) {
 	}
 	if got := strings.Join(stableEnvironment(nil), "\n"); !strings.Contains(got, "PATH=/usr/sbin:/usr/bin:/sbin:/bin") {
 		t.Fatalf("stable environment = %q", got)
-	}
-}
-
-func TestExecxHelperProcess(t *testing.T) {
-	switch os.Getenv("GO_WANT_EXECX_HELPER") {
-	case "output":
-		_, _ = os.Stdout.WriteString(strings.Repeat("o", 128))
-		_, _ = os.Stderr.WriteString(strings.Repeat("e", 128))
-		os.Exit(0)
-	case "sleep":
-		time.Sleep(5 * time.Second)
-		os.Exit(0)
-	case "exit":
-		os.Exit(23)
 	}
 }
 
