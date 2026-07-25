@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ohtoe02/ohtools-plugin-catalog
-          ref: 4debba915b043cd4abe3b78e3166c44cf77b6dd0
+          ref: 2cf42710b37fc755b669631f1d27adbd73b6646c
           path: .catalog-contract-source
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -35,9 +35,13 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           IFS=$'\t' read -r plugin version <<< "$(go run ./tools/pluginregistry resolve-tag "$tag")"
+          RELEASE_COMMIT="$(git rev-parse --verify "${GITHUB_REF_NAME}^{commit}")"
+          BUILD_DATE="$(git for-each-ref --format='%(taggerdate:iso-strict)' "refs/tags/${GITHUB_REF_NAME}")"
+          test -n "${BUILD_DATE}"
           echo "PLUGIN=$plugin" >> "$GITHUB_ENV"
           echo "VERSION=$version" >> "$GITHUB_ENV"
-          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "RELEASE_COMMIT=$RELEASE_COMMIT" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$BUILD_DATE" >> "$GITHUB_ENV"
       - name: Test
         run: go test -race ./...
       - name: Build static binary
@@ -45,7 +49,7 @@ jobs:
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-            -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${GITHUB_SHA} -X main.buildDate=${BUILD_DATE}" \
+            -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${RELEASE_COMMIT} -X main.buildDate=${BUILD_DATE}" \
             -o "dist/${PLUGIN}_linux_amd64" "./cmd/${PLUGIN}"
           file "dist/${PLUGIN}_linux_amd64" | grep -q "statically linked"
           "dist/${PLUGIN}_linux_amd64" manifest --protocol=1 > "dist/${PLUGIN}_manifest-v1.json"
@@ -67,23 +71,26 @@ jobs:
           syft-version: v1.44.0
       - name: Generate SPDX SBOM
         shell: bash
-        run: syft "file:dist/${PLUGIN}_linux_amd64" -o "spdx-json=dist/${PLUGIN}_linux_amd64.spdx.json"
-      - name: Atomically create and publish immutable release
+        run: |
+          syft "file:dist/${PLUGIN}_linux_amd64" \
+            -o "spdx-json=dist/${PLUGIN}_linux_amd64.spdx.raw.json"
+          binary_sha="$(sha256sum "dist/${PLUGIN}_linux_amd64" | cut -d ' ' -f 1)"
+          go run ./tools/sbomnormalize \
+            --created "${BUILD_DATE}" \
+            --namespace "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}/sbom/${binary_sha}" \
+            < "dist/${PLUGIN}_linux_amd64.spdx.raw.json" \
+            > "dist/${PLUGIN}_linux_amd64.spdx.json"
+      - name: Resume or publish immutable draft release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
+          go run ./tools/releasepublish \
             --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --draft \
-            --generate-notes
-          gh release upload "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            "dist/${PLUGIN}_linux_amd64" \
-            "dist/${PLUGIN}_linux_amd64.sha256" \
-            "dist/${PLUGIN}_linux_amd64.spdx.json" \
-            "dist/${PLUGIN}_manifest-v1.json" \
-            "dist/${PLUGIN}_release-metadata-v1.json"
-          gh release edit "${GITHUB_REF_NAME}" --draft=false \
-            --repo "${GITHUB_REPOSITORY}"
+            --tag "${GITHUB_REF_NAME}" \
+            --commit "${RELEASE_COMMIT}" \
+            --asset "dist/${PLUGIN}_linux_amd64" \
+            --asset "dist/${PLUGIN}_linux_amd64.sha256" \
+            --asset "dist/${PLUGIN}_linux_amd64.spdx.json" \
+            --asset "dist/${PLUGIN}_manifest-v1.json" \
+            --asset "dist/${PLUGIN}_release-metadata-v1.json"
