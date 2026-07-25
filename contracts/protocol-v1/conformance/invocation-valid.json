@@ -1,0 +1,15 @@
+{
+  "schema_version": "1",
+  "cases": [
+    {
+      "name": "mutation plan with typed options",
+      "phase": "plan",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":{\"mode\":\"safe\",\"enabled\":true,\"count\":2,\"timeout\":\"30s\"},\"deadline\":\"2026-07-25T12:00:00Z\"}"
+    },
+    {
+      "name": "mutation execute with approved digest",
+      "phase": "execute",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":{},\"plan_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+    }
+  ]
+}

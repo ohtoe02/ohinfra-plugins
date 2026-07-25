@@ -1,0 +1,46 @@
+{
+  "schema_version": "1",
+  "plugins": [
+    {
+      "name": "system-base",
+      "command": "./cmd/system-base",
+      "description": "Operating system information and health diagnostics for ohtools.",
+      "homepage": "https://github.com/ohtoe02/ohtools-plugins",
+      "minimum_ohtools_version": "0.3.2",
+      "release_enabled": true
+    },
+    {
+      "name": "storage-base",
+      "command": "./cmd/storage-base",
+      "description": "Filesystem capacity and usage diagnostics for ohtools.",
+      "homepage": "https://github.com/ohtoe02/ohtools-plugins",
+      "minimum_ohtools_version": "0.3.2",
+      "release_enabled": true
+    },
+    {
+      "name": "systemd-base",
+      "command": "./cmd/systemd-base",
+      "description": "Systemd service status, logs, and controlled restart operations for ohtools.",
+      "homepage": "https://github.com/ohtoe02/ohtools-plugins",
+      "minimum_ohtools_version": "0.3.2",
+      "release_enabled": true
+    },
+    {
+      "name": "docker-base",
+      "command": "./cmd/docker-base",
+      "description": "Docker Engine and Compose diagnostics for ohtools.",
+      "homepage": "https://github.com/ohtoe02/ohtools-plugins",
+      "minimum_ohtools_version": "0.3.2",
+      "release_enabled": true
+    },
+    {
+      "name": "server-setup-base",
+      "command": "./cmd/server-setup-base",
+      "description": "Desired-state server setup and controlled upgrade operations for ohtools.",
+      "homepage": "https://github.com/ohtoe02/ohtools-plugins",
+      "minimum_ohtools_version": "0.3.3",
+      "release_enabled": true,
+      "readiness_job": "server-setup-readiness"
+    }
+  ]
+}

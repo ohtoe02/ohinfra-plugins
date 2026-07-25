@@ -1,0 +1,280 @@
+{
+  "schema_version": "1",
+  "cases": [
+    {
+      "name": "use path mismatch",
+      "error_contains": "use",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "commands": [
+          {
+            "path": ["example", "status"],
+            "use": "different",
+            "short": "Show example status",
+            "category": "diagnostic",
+            "arguments": [],
+            "flags": [],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "multiline help",
+      "error_contains": "control",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "commands": [
+          {
+            "path": ["example", "status"],
+            "use": "status",
+            "short": "first\nsecond",
+            "category": "diagnostic",
+            "arguments": [],
+            "flags": [],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "duplicate command path",
+      "error_contains": "duplicate command",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "commands": [
+          {
+            "path": ["example", "status"],
+            "use": "status",
+            "short": "Show example status",
+            "category": "diagnostic",
+            "arguments": [],
+            "flags": [],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          },
+          {
+            "path": ["example", "status"],
+            "use": "status",
+            "short": "Show the duplicate status",
+            "category": "diagnostic",
+            "arguments": [],
+            "flags": [],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "reserved retry flag",
+      "error_contains": "reserved",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "commands": [
+          {
+            "path": ["example", "status"],
+            "use": "status",
+            "short": "Show example status",
+            "category": "diagnostic",
+            "arguments": [],
+            "flags": [
+              {
+                "name": "retry-request-id",
+                "type": "string"
+              }
+            ],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "required argument after optional",
+      "error_contains": "follows an optional",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "commands": [
+          {
+            "path": ["example", "status"],
+            "use": "status",
+            "short": "Show example status",
+            "category": "diagnostic",
+            "arguments": [
+              {
+                "name": "optional",
+                "required": false,
+                "variadic": false
+              },
+              {
+                "name": "required",
+                "required": true,
+                "variadic": false
+              }
+            ],
+            "flags": [],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "non-integral int default",
+      "error_contains": "integer",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "commands": [
+          {
+            "path": ["example", "status"],
+            "use": "status",
+            "short": "Show example status",
+            "category": "diagnostic",
+            "arguments": [],
+            "flags": [
+              {
+                "name": "count",
+                "type": "int",
+                "default": 1.5
+              }
+            ],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "duplicate argument",
+      "error_contains": "duplicate argument",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "commands": [
+          {
+            "path": ["example", "status"],
+            "use": "status",
+            "short": "Show example status",
+            "category": "diagnostic",
+            "arguments": [
+              {"name": "item", "required": false, "variadic": false},
+              {"name": "item", "required": false, "variadic": false}
+            ],
+            "flags": [],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "duplicate flag",
+      "error_contains": "duplicate flag",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "commands": [
+          {
+            "path": ["example", "status"],
+            "use": "status",
+            "short": "Show example status",
+            "category": "diagnostic",
+            "arguments": [],
+            "flags": [
+              {"name": "mode", "type": "string"},
+              {"name": "mode", "type": "string"}
+            ],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "variadic argument is not last",
+      "error_contains": "must be last",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "commands": [
+          {
+            "path": ["example", "status"],
+            "use": "status",
+            "short": "Show example status",
+            "category": "diagnostic",
+            "arguments": [
+              {"name": "item", "required": false, "variadic": true},
+              {"name": "tail", "required": false, "variadic": false}
+            ],
+            "flags": [],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "malformed duration default",
+      "error_contains": "duration",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "commands": [
+          {
+            "path": ["example", "status"],
+            "use": "status",
+            "short": "Show example status",
+            "category": "diagnostic",
+            "arguments": [],
+            "flags": [
+              {"name": "wait", "type": "duration", "default": "soon"}
+            ],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          }
+        ]
+      }
+    }
+  ]
+}

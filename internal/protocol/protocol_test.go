@@ -185,6 +185,12 @@ func TestServeExecuteStrictlyDecodesInvocationAndNormalizesResult(t *testing.T) 
 		`{"protocol_version":1,"unknown":true}`,
 		`{"protocol_version":1,"protocol_version":1}`,
 		`{"protocol_version":1} {}`,
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],"arguments":null,"options":{}}`,
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],"options":{}}`,
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],"arguments":[],"options":null}`,
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],"arguments":[]}`,
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],"arguments":[],"options":{}}` +
+			strings.Repeat(" ", 1<<20),
 	} {
 		stdout.Reset()
 		stderr.Reset()
@@ -196,8 +202,50 @@ func TestServeExecuteStrictlyDecodesInvocationAndNormalizesResult(t *testing.T) 
 			&stderr,
 		)
 		if exit != ExitArguments || stderr.Len() == 0 {
-			t.Fatalf("strict decode %q exit=%d stderr=%q", malformed, exit, stderr.String())
+			t.Fatalf("strict decode len=%d exit=%d stderr=%q", len(malformed), exit, stderr.String())
 		}
+	}
+}
+
+func TestServeRejectsRawInvalidUTF8InvocationBeforeHandler(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	definition := Definition{
+		Manifest: Manifest{
+			ProtocolVersion: 1,
+			Name:            "system-base",
+			Version:         "1.0.0",
+			Commands: []Command{{
+				Path: []string{"system", "info"}, Use: "info", Short: "info",
+				Category: CategoryDiagnostic, Arguments: []Argument{}, Flags: []Flag{},
+			}},
+		},
+		Execute: func(context.Context, Invocation) (Result, error) {
+			called = true
+			return Result{Status: StatusPass}, nil
+		},
+	}
+	encoded := []byte(
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],` +
+			`"arguments":["value` + string([]byte{0xff}) + `"],"options":{}}`,
+	)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exit := Serve(
+		definition,
+		[]string{"system-base", "execute", "--protocol=1"},
+		bytes.NewReader(encoded),
+		&stdout,
+		&stderr,
+	)
+
+	if exit != ExitArguments || called {
+		t.Fatalf("exit=%d called=%t stdout=%q stderr=%q", exit, called, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "valid UTF-8") {
+		t.Fatalf("stderr=%q", stderr.String())
 	}
 }
 

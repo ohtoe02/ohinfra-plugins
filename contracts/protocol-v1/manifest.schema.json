@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ohtoe02/ohtools-plugin-catalog/contracts/protocol-v1/manifest.schema.json",
+  "title": "ohtools executable plugin manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "name",
+    "version",
+    "commands"
+  ],
+  "properties": {
+    "protocol_version": {
+      "const": 1
+    },
+    "name": {
+      "$ref": "#/$defs/identifier"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "$ref": "#/$defs/help"
+    },
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {
+        "$ref": "#/$defs/command"
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "help": {
+      "type": "string",
+      "maxLength": 512,
+      "pattern": "^(?:[^\\s\\u0000-\\u001f\\u007f-\\u009f](?:[^\\u0000-\\u001f\\u007f-\\u009f]*[^\\s\\u0000-\\u001f\\u007f-\\u009f])?)?$",
+      "x-ohtools-max-utf8-bytes": 512
+    },
+    "argument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "required",
+        "variadic"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/identifier"
+        },
+        "description": {
+          "$ref": "#/$defs/help"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "variadic": {
+          "type": "boolean"
+        }
+      }
+    },
+    "flag": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/identifier"
+        },
+        "type": {
+          "enum": [
+            "string",
+            "bool",
+            "int",
+            "duration"
+          ]
+        },
+        "description": {
+          "$ref": "#/$defs/help"
+        },
+        "default": true
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "string"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "default": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "bool"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "default": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "int"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "default": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "duration"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "default": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "use",
+        "short",
+        "category",
+        "arguments",
+        "flags",
+        "requires_root",
+        "requires_force",
+        "supports_dry_run",
+        "requires_confirmation"
+      ],
+      "properties": {
+        "path": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "use": {
+          "$ref": "#/$defs/help"
+        },
+        "short": {
+          "$ref": "#/$defs/help"
+        },
+        "category": {
+          "enum": [
+            "diagnostic",
+            "operational",
+            "runbook"
+          ]
+        },
+        "arguments": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/argument"
+          }
+        },
+        "flags": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/flag"
+          }
+        },
+        "requires_root": {
+          "type": "boolean"
+        },
+        "requires_force": {
+          "type": "boolean"
+        },
+        "supports_dry_run": {
+          "type": "boolean"
+        },
+        "requires_confirmation": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

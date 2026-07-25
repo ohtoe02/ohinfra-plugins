@@ -1,0 +1,70 @@
+{
+  "schema_version": "1",
+  "cases": [
+    {
+      "name": "canonical diagnostic",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "description": "Conformance fixture",
+        "commands": [
+          {
+            "path": [
+              "example",
+              "status"
+            ],
+            "use": "status",
+            "short": "Show example status",
+            "category": "diagnostic",
+            "arguments": [],
+            "flags": [],
+            "requires_root": false,
+            "requires_force": false,
+            "supports_dry_run": false,
+            "requires_confirmation": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty use derives canonical name",
+      "manifest": {
+        "protocol_version": 1,
+        "name": "example-plugin",
+        "version": "1.0.0",
+        "commands": [
+          {
+            "path": [
+              "example",
+              "apply"
+            ],
+            "use": "",
+            "short": "",
+            "category": "operational",
+            "arguments": [
+              {
+                "name": "item",
+                "description": "",
+                "required": false,
+                "variadic": true
+              }
+            ],
+            "flags": [
+              {
+                "name": "mode",
+                "type": "string",
+                "description": "",
+                "default": "safe"
+              }
+            ],
+            "requires_root": true,
+            "requires_force": false,
+            "supports_dry_run": true,
+            "requires_confirmation": true
+          }
+        ]
+      }
+    }
+  ]
+}

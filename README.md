@@ -16,6 +16,12 @@ do not alter operator-facing CLI paths: `docker-base`, for example, provides
 | `storage-base` | `disk` | `disk usage [path]` |
 | `systemd-base` | `service`, `logs` | `service status`, `service logs`, `service restart` |
 | `docker-base` | `docker`, `compose` | Docker diagnostics and the read-only Compose baseline |
+| `server-setup-base` | `setup` | `setup check`, `setup apply [item...]`, `setup upgrade` |
+
+`plugins.json` is the single source for CI build matrices and release tag
+authorization. `server-setup-base` is release-enabled only on its completed
+implementation branch and retains a separate mandatory
+`server-setup-readiness` CI gate.
 
 The roadmap also reserves `network-base`, `postgres-base`, `k8s-base`,
 `security-base`, `apt-base`, `java-base`, `kafka-base`,
@@ -48,8 +54,9 @@ See [development](docs/development.md), [configuration](docs/configuration.md),
 ## Versioning
 
 Plugins are released independently with tags such as `system-base-v1.0.0`.
-A release contains the raw `<plugin>_linux_amd64` binary, its SHA-256 file, and
-an SPDX JSON SBOM.
+A release contains the raw `<plugin>_linux_amd64` binary, its SHA-256 file, an
+SPDX JSON SBOM, the exact manifest, and a `release-metadata-v1` sidecar for
+deterministic catalog import.
 
 Catalog metadata and signing remain in the separate
 [`ohtools-plugin-catalog`](https://github.com/ohtoe02/ohtools-plugin-catalog)

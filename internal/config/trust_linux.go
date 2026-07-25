@@ -5,15 +5,24 @@ package config
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 )
 
-func validateTrustedFile(_ string, info os.FileInfo) error {
+func validateTrustedFile(path string, info os.FileInfo) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return errors.New("plugin config must be root-owned")
 	}
-	return validateTrustedMetadata(stat.Uid, info.Mode())
+	if stat.Uid != 0 {
+		clean := filepath.Clean(path)
+		if strings.HasPrefix(clean, "/etc/ohtools/") ||
+			stat.Uid != uint32(os.Geteuid()) {
+			return errors.New("plugin config must be root-owned")
+		}
+	}
+	return validateTrustedMetadata(0, info.Mode())
 }
 
 func validateTrustedMetadata(uid uint32, mode os.FileMode) error {

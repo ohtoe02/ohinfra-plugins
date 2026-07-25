@@ -51,3 +51,78 @@ registry_timeout: 10s
 Configuration must not contain tokens, passwords, private keys, registry
 credentials, or Docker credentials. `docker registry-test` supports anonymous
 HTTPS probing only.
+
+## `server-setup-base`
+
+Mutations require the trusted system profile
+`/etc/ohtools/plugins/server-setup-base.yaml`; `setup check` can run with safe
+compiled defaults when the file is absent.
+
+```yaml
+enabled_items:
+  - packages
+  - shell-history
+  - cron-permissions
+  - ssh
+  - fail2ban
+  - time-sync
+  - security-updates
+  - logging
+  - auditd
+  - sysctl
+packages:
+  - curl
+  - vim
+administrators:
+  - name: operator
+    groups: [adm, sudo]
+    authorized_key_sources:
+      - /etc/ohtools/plugins/keys/operator.pub
+ssh_port: 22
+manage_firewall: false
+zabbix:
+  enabled: false
+  server: 192.0.2.10
+  hostname: web-01
+  repository_package_url: https://repo.zabbix.com/example/zabbix-release.deb
+  repository_package_size: 1
+  repository_package_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+```
+
+When Zabbix is enabled, replace all repository package fields with the exact
+HTTPS URL, byte size, and lowercase SHA-256 of the immutable package from
+`repo.zabbix.com`. Key source files must be regular, root-owned files below
+`/etc/ohtools/plugins/keys`, must not be group/world-writable, and may contain
+public keys only. Enabling SSH hardening requires at least one administrator
+with such a key source. A non-default SSH port additionally requires
+`manage_firewall: true`; the managed firewall is applied before sshd is
+reloaded.
+
+On releases whose vendor `sshd_config` lacks an early drop-in include, the
+plugin transactionally inserts
+`Include /etc/ssh/sshd_config.d/*.conf`, validates it, and rolls it back if
+effective-state validation or reload fails. Firewall persistence is provided
+by the dedicated `ohtools-server-setup-firewall.service`; it loads only the
+ohtools-owned nftables file and does not replace the distribution's main
+nftables configuration.
+
+The supported OS matrix is Debian 10–13 and Ubuntu 20.04, 22.04, and 24.04 LTS.
+Debian 10 requires an active Freexian ELTS source; Ubuntu 20.04 requires an
+attached Ubuntu Pro/ESM entitlement before a mutation is planned. `setup
+upgrade` plans with a temporary isolated APT-index workspace. Immediately
+before applying, it creates a fresh workspace, refreshes and recomputes the
+candidate set, and requires an exact match with the confirmed plan. The exact
+package versions are then installed with the same isolated lists and archives
+options. It never touches the system APT lists and never runs `dist-upgrade`,
+`autoremove`, or reboot.
+
+Managed-file activations use a durable schema-v1 phase journal and fsync each
+critical file and parent-directory transition. A later `setup apply`
+automatically resumes verified cleanup or restores the trusted rollback copy
+before retrying. SSH vendor-file include insertion uses the same deterministic
+stage/rollback recovery rules. Unsafe, malformed, untrusted, or incomplete
+recovery artifacts still fail closed and require administrator inspection;
+serialized paths are never accepted as filesystem instructions.
+Rollback reactivation and firewall restoration use their own bounded cleanup
+deadline, so cancellation of the initiating operation cannot silently skip
+restoring the previously active state.
