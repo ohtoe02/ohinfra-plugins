@@ -235,6 +235,7 @@ func validOptionValue(flagType string, value any) bool {
 
 func normalizeBindingPlan(plan Plan, command Command) Plan {
 	plan = NormalizePlan(plan)
+	plan.CommandID = strings.Join(command.Path, ".")
 	plan.RequiresRoot = command.RequiresRoot
 	plan.RequiresForce = command.RequiresForce
 	plan.RequiresConfirmation = command.RequiresConfirmation

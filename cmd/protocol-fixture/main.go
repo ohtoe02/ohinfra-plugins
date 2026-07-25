@@ -28,6 +28,15 @@ func main() {
 			},
 			output,
 		),
+		protocol.Diagnostic(
+			protocol.CommandSpec{
+				Path: []string{"fixture", "hang"}, Use: "hang <marker>",
+				Short:     "Hold a fixture resource until the process is terminated",
+				Arguments: []protocol.Argument{{Name: "marker", Description: "Fixture marker file", Required: true}},
+				Flags:     []protocol.Flag{},
+			},
+			hang,
+		),
 		protocol.Mutation(
 			protocol.CommandSpec{
 				Path: []string{"fixture", "apply"}, Use: "apply <state>",
@@ -71,6 +80,28 @@ func output(_ context.Context, invocation protocol.Invocation) (protocol.Result,
 	}), nil
 }
 
+func hang(_ context.Context, invocation protocol.Invocation) (protocol.Result, error) {
+	markerPath, err := fixturePath(invocation)
+	if err != nil {
+		return protocol.Result{}, err
+	}
+	file, err := os.OpenFile(markerPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return protocol.Result{}, err
+	}
+	defer file.Close()
+	if _, err := file.WriteString("fixture process holds this file open\n"); err != nil {
+		return protocol.Result{}, err
+	}
+	if err := file.Sync(); err != nil {
+		return protocol.Result{}, err
+	}
+	for {
+		time.Sleep(time.Hour)
+		runtime.KeepAlive(file)
+	}
+}
+
 func plan(ctx context.Context, invocation protocol.Invocation) (protocol.Plan, error) {
 	select {
 	case <-ctx.Done():
@@ -92,10 +123,9 @@ func plan(ctx context.Context, invocation protocol.Invocation) (protocol.Plan, e
 		})
 	}
 	return protocol.Plan{
-		CommandID: "fixture.apply",
-		Summary:   "Apply the trusted protocol fixture state",
-		Changes:   changes,
-		Risks:     []string{"fixture state is written to the requested test path"},
+		Summary: "Apply the trusted protocol fixture state",
+		Changes: changes,
+		Risks:   []string{"fixture state is written to the requested test path"},
 	}, nil
 }
 

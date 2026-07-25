@@ -1,6 +1,7 @@
 package pluginregistry
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,6 +195,56 @@ func TestLoadRejectsSymlinkedReleaseCommand(t *testing.T) {
 		t.Fatal("symlinked release command accepted")
 	} else if !strings.Contains(strings.ToLower(err.Error()), "symlink") {
 		t.Fatalf("symlink rejected for the wrong reason: %v", err)
+	}
+}
+
+func TestReleaseWorkflowRefusesToOverwritePublishedAssets(t *testing.T) {
+	workflow, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(workflow)
+	for _, required := range []string{
+		`gh release view "${GITHUB_REF_NAME}"`,
+		"release already exists; refusing to replace immutable assets",
+		"overwrite_files: false",
+	} {
+		if !strings.Contains(content, required) {
+			t.Errorf("release workflow lacks fail-closed immutability guard %q", required)
+		}
+	}
+}
+
+func TestCIAndReleaseCompareVendoredContractsWithPinnedCanonicalCommit(t *testing.T) {
+	var lock struct {
+		SourceCommit string `json:"source_commit"`
+	}
+	encodedLock, err := os.ReadFile(filepath.Join("..", "..", "contracts", "protocol-v1.lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encodedLock, &lock); err != nil {
+		t.Fatal(err)
+	}
+	if lock.SourceCommit == "" {
+		t.Fatal("contract lock has no source commit")
+	}
+	for _, workflowName := range []string{"ci.yml", "release.yml"} {
+		workflow, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", workflowName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		content := string(workflow)
+		for _, required := range []string{
+			"repository: ohtoe02/ohtools-plugin-catalog",
+			"ref: " + lock.SourceCommit,
+			"path: .catalog-contract-source",
+			"go run ./tools/contractcheck --canonical .catalog-contract-source/contracts/protocol-v1",
+		} {
+			if !strings.Contains(content, required) {
+				t.Errorf("%s lacks pinned canonical contract comparison %q", workflowName, required)
+			}
+		}
 	}
 }
 

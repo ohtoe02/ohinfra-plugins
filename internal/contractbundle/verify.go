@@ -1,6 +1,7 @@
 package contractbundle
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -102,6 +103,38 @@ func Verify(bundleRoot, lockPath string) error {
 	}
 	if len(actual) != len(listed) {
 		return errors.New("SHA256SUMS references a missing contract file")
+	}
+	return nil
+}
+
+func VerifyAgainstCanonical(bundleRoot, lockPath, canonicalRoot string) error {
+	if err := Verify(bundleRoot, lockPath); err != nil {
+		return err
+	}
+	if err := Verify(canonicalRoot, lockPath); err != nil {
+		return fmt.Errorf("verify canonical contract source: %w", err)
+	}
+	sums, err := readBoundedRegular(filepath.Join(bundleRoot, "SHA256SUMS"), 1<<20)
+	if err != nil {
+		return err
+	}
+	listed, err := parseSums(sums)
+	if err != nil {
+		return err
+	}
+	listed["SHA256SUMS"] = ""
+	for relative := range listed {
+		vendored, err := os.ReadFile(filepath.Join(bundleRoot, filepath.FromSlash(relative)))
+		if err != nil {
+			return err
+		}
+		canonical, err := os.ReadFile(filepath.Join(canonicalRoot, filepath.FromSlash(relative)))
+		if err != nil {
+			return fmt.Errorf("read canonical contract file %q: %w", relative, err)
+		}
+		if !bytes.Equal(vendored, canonical) {
+			return fmt.Errorf("vendored contract file %q differs from canonical source", relative)
+		}
 	}
 	return nil
 }
