@@ -207,6 +207,48 @@ func TestServeExecuteStrictlyDecodesInvocationAndNormalizesResult(t *testing.T) 
 	}
 }
 
+func TestServeRejectsRawInvalidUTF8InvocationBeforeHandler(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	definition := Definition{
+		Manifest: Manifest{
+			ProtocolVersion: 1,
+			Name:            "system-base",
+			Version:         "1.0.0",
+			Commands: []Command{{
+				Path: []string{"system", "info"}, Use: "info", Short: "info",
+				Category: CategoryDiagnostic, Arguments: []Argument{}, Flags: []Flag{},
+			}},
+		},
+		Execute: func(context.Context, Invocation) (Result, error) {
+			called = true
+			return Result{Status: StatusPass}, nil
+		},
+	}
+	encoded := []byte(
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],` +
+			`"arguments":["value` + string([]byte{0xff}) + `"],"options":{}}`,
+	)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exit := Serve(
+		definition,
+		[]string{"system-base", "execute", "--protocol=1"},
+		bytes.NewReader(encoded),
+		&stdout,
+		&stderr,
+	)
+
+	if exit != ExitArguments || called {
+		t.Fatalf("exit=%d called=%t stdout=%q stderr=%q", exit, called, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "valid UTF-8") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
 func TestPlanDigestMatchesCanonicalJSON(t *testing.T) {
 	t.Parallel()
 

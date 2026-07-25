@@ -179,6 +179,52 @@ func TestBuildReleaseMetadataBindsBinaryAndManifest(t *testing.T) {
 	}
 }
 
+func TestBuildReleaseMetadataRejectsBinaryReplacedBetweenLstatAndOpen(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	binary := filepath.Join(root, "system-base_linux_amd64")
+	replacement := filepath.Join(root, "replacement")
+	if err := os.WriteFile(binary, []byte("original binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(replacement, []byte("replaced binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{
+		Name:                  "system-base",
+		Description:           "System diagnostics",
+		Homepage:              "https://github.com/ohtoe02/ohtools-plugins",
+		MinimumOhtoolsVersion: "0.3.2",
+		ReleaseEnabled:        true,
+	}
+	manifest := protocol.Manifest{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Name:            "system-base",
+		Version:         "1.1.0",
+		Description:     "System diagnostics",
+		Commands: []protocol.Command{{
+			Path: []string{"system", "info"}, Use: "info", Short: "Show system information",
+			Category: protocol.CategoryDiagnostic, Arguments: []protocol.Argument{}, Flags: []protocol.Flag{},
+		}},
+	}
+
+	_, err := buildReleaseMetadataWithOpener(
+		entry,
+		"1.1.0",
+		manifest,
+		binary,
+		"https://github.com/ohtoe02/ohtools-plugins/releases/download/system-base-v1.1.0/system-base_linux_amd64",
+		time.Date(2026, 7, 25, 10, 0, 0, 0, time.UTC),
+		func(string) (*os.File, error) {
+			return os.Open(replacement)
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "changed while") {
+		t.Fatalf("replacement error=%v", err)
+	}
+}
+
 func TestLoadRejectsSymlinkedReleaseCommand(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "cmd"), 0o700); err != nil {

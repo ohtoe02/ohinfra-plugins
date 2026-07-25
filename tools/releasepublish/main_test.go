@@ -1,13 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/ohtoe02/ohtools-plugins/internal/pluginregistry"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
 )
 
 const (
@@ -155,7 +164,7 @@ func TestPublishReleaseResumesMatchingDraftAndUploadsOnlyMissingAssets(t *testin
 	if github.draft {
 		t.Fatal("matching draft was not published")
 	}
-	wantMissing := []string{filepath.Base(assets[1])}
+	wantMissing := assetNames(assets[1:])
 	if !equalStrings(github.uploadAssets, wantMissing) {
 		t.Fatalf("uploaded assets=%v want=%v", github.uploadAssets, wantMissing)
 	}
@@ -382,6 +391,158 @@ func TestPublishReleaseFailsClosedForUnexpectedDraftAsset(t *testing.T) {
 	}
 }
 
+func TestPublishReleaseRejectsInconsistentStagedArtifactSetBeforeGitHubMutation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, []string)
+	}{
+		{
+			name: "checksum sidecar",
+			mutate: func(t *testing.T, assets []string) {
+				t.Helper()
+				writeAsset(t, assets[1], strings.Repeat("0", 64)+"  system-base_linux_amd64\n")
+			},
+		},
+		{
+			name: "sbom namespace",
+			mutate: func(t *testing.T, assets []string) {
+				t.Helper()
+				var document map[string]any
+				decodeTestJSON(t, assets[2], &document)
+				document["documentNamespace"] = "https://example.invalid/wrong"
+				writeJSONAsset(t, assets[2], document)
+			},
+		},
+		{
+			name: "manifest identity",
+			mutate: func(t *testing.T, assets []string) {
+				t.Helper()
+				var manifest protocol.Manifest
+				decodeTestJSON(t, assets[3], &manifest)
+				manifest.Version = "9.9.9"
+				writeJSONAsset(t, assets[3], manifest)
+			},
+		},
+		{
+			name: "metadata digest",
+			mutate: func(t *testing.T, assets []string) {
+				t.Helper()
+				var metadata pluginregistry.ReleaseMetadata
+				decodeTestJSON(t, assets[4], &metadata)
+				metadata.Asset.SHA256 = strings.Repeat("f", 64)
+				writeJSONAsset(t, assets[4], metadata)
+			},
+		},
+		{
+			name: "metadata manifest",
+			mutate: func(t *testing.T, assets []string) {
+				t.Helper()
+				var metadata pluginregistry.ReleaseMetadata
+				decodeTestJSON(t, assets[4], &metadata)
+				metadata.Manifest.Commands[0].Short = "Different manifest"
+				writeJSONAsset(t, assets[4], metadata)
+			},
+		},
+		{
+			name: "raw invalid UTF-8 metadata",
+			mutate: func(t *testing.T, assets []string) {
+				t.Helper()
+				encoded, err := os.ReadFile(assets[4])
+				if err != nil {
+					t.Fatal(err)
+				}
+				offset := bytes.Index(encoded, []byte("System diagnostics"))
+				if offset < 0 {
+					t.Fatal("metadata fixture does not contain description")
+				}
+				encoded[offset] = 0xff
+				if err := os.WriteFile(assets[4], encoded, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assets := writeTestAssets(t)
+			test.mutate(t, assets)
+			github := &fakeGitHub{
+				remoteCommit: testCommit,
+				assets:       map[string][]byte{},
+			}
+
+			err := publishRelease(
+				context.Background(),
+				github,
+				publishOptions{
+					Repository: testRepository,
+					Tag:        testTag,
+					Commit:     testCommit,
+					Assets:     assets,
+				},
+			)
+			if err == nil {
+				t.Fatal("inconsistent artifact set was accepted")
+			}
+			if github.createCalls != 0 || github.editCalls != 0 || len(github.uploadAssets) != 0 {
+				t.Fatal("GitHub release was mutated for an inconsistent artifact set")
+			}
+		})
+	}
+}
+
+func TestStageReleaseAssetsRejectsParentTraversal(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(root, "system-base_linux_amd64")
+	writeAsset(t, binary, "binary")
+	traversal := filepath.Join(root, "nested") +
+		string(filepath.Separator) + ".." +
+		string(filepath.Separator) + "system-base_linux_amd64"
+
+	_, err := stageReleaseAssets([]string{traversal}, filepath.Join(t.TempDir(), "staged"))
+	if err == nil || !strings.Contains(err.Error(), "traversal") {
+		t.Fatalf("traversal error=%v", err)
+	}
+}
+
+func TestStageReleaseAssetsRejectsSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	link := filepath.Join(root, "system-base_linux_amd64")
+	writeAsset(t, target, "binary")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	_, err := stageReleaseAssets([]string{link}, filepath.Join(t.TempDir(), "staged"))
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "symlink") {
+		t.Fatalf("symlink error=%v", err)
+	}
+}
+
+func TestOpenRegularNonSymlinkRejectsDescriptorSubstitution(t *testing.T) {
+	root := t.TempDir()
+	expected := filepath.Join(root, "expected")
+	replacement := filepath.Join(root, "replacement")
+	writeAsset(t, expected, "expected")
+	writeAsset(t, replacement, "replaced")
+
+	file, _, err := openRegularNonSymlinkWithOpener(
+		expected,
+		func(string) (*os.File, error) {
+			return os.Open(replacement)
+		},
+	)
+	if file != nil {
+		_ = file.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "changed while") {
+		t.Fatalf("descriptor substitution error=%v", err)
+	}
+}
+
 func TestPublishReleaseFailsClosedForRemoteTagCommitMismatch(t *testing.T) {
 	assets := writeTestAssets(t)
 	github := &fakeGitHub{
@@ -410,16 +571,91 @@ func TestPublishReleaseFailsClosedForRemoteTagCommitMismatch(t *testing.T) {
 func writeTestAssets(t *testing.T) []string {
 	t.Helper()
 	root := t.TempDir()
+	binary := []byte("immutable binary")
+	digest := sha256.Sum256(binary)
+	sha := hex.EncodeToString(digest[:])
+	published := time.Date(2026, 7, 25, 10, 0, 0, 0, time.UTC)
+	manifest := protocol.Manifest{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Name:            "system-base",
+		Version:         "1.1.0",
+		Description:     "System diagnostics",
+		Commands: []protocol.Command{{
+			Path: []string{"system", "info"}, Use: "info", Short: "Show system information",
+			Category: protocol.CategoryDiagnostic, Arguments: []protocol.Argument{}, Flags: []protocol.Flag{},
+		}},
+	}
+	metadata := pluginregistry.ReleaseMetadata{
+		SchemaVersion:         "1",
+		Name:                  "system-base",
+		Description:           "System diagnostics",
+		Homepage:              "https://github.com/ohtoe02/ohtools-plugins",
+		Version:               "1.1.0",
+		MinimumOhtoolsVersion: "0.3.2",
+		PublishedAt:           published,
+		Asset: pluginregistry.ReleaseAsset{
+			OS:        "linux",
+			Arch:      "amd64",
+			URL:       "https://github.com/ohtoe02/ohtools-plugins/releases/download/system-base-v1.1.0/system-base_linux_amd64",
+			SHA256:    sha,
+			SizeBytes: int64(len(binary)),
+		},
+		Manifest: manifest,
+	}
+	sbom := map[string]any{
+		"spdxVersion": "SPDX-2.3",
+		"documentNamespace": fmt.Sprintf(
+			"https://github.com/%s/releases/tag/%s/sbom/%s",
+			testRepository,
+			testTag,
+			sha,
+		),
+		"creationInfo": map[string]any{
+			"created": published.Format(time.RFC3339),
+		},
+	}
 	assets := []string{
 		filepath.Join(root, "system-base_linux_amd64"),
+		filepath.Join(root, "system-base_linux_amd64.sha256"),
+		filepath.Join(root, "system-base_linux_amd64.spdx.json"),
 		filepath.Join(root, "system-base_manifest-v1.json"),
+		filepath.Join(root, "system-base_release-metadata-v1.json"),
 	}
-	for index, path := range assets {
-		if err := os.WriteFile(path, []byte{byte(index + 1)}, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeAsset(t, assets[0], string(binary))
+	writeAsset(t, assets[1], fmt.Sprintf("%s  system-base_linux_amd64\n", sha))
+	writeJSONAsset(t, assets[2], sbom)
+	writeJSONAsset(t, assets[3], manifest)
+	writeJSONAsset(t, assets[4], metadata)
 	return assets
+}
+
+func writeAsset(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeJSONAsset(t *testing.T, path string, value any) {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func decodeTestJSON(t *testing.T, path string, target any) {
+	t.Helper()
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, target); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func readTestAssets(t *testing.T, paths []string) map[string][]byte {
