@@ -4,7 +4,8 @@
 
 ```text
 cmd/<plugin>/main.go       composition root and release metadata
-internal/protocol/         protocol v1 adapter and canonical schemas
+internal/protocol/         private protocol v1 registry and adapters
+contracts/protocol-v1/    vendored language-neutral contract and conformance vectors
 internal/config/           strict, trusted system configuration
 internal/execx/            bounded trusted executable runner
 internal/redact/           recursive secret redaction
@@ -17,13 +18,15 @@ protocol v1.
 
 ## Adding a command
 
-1. Add its exact CLI path to the owning domain manifest. Do not introduce a
-   plugin prefix.
+1. Add its exact CLI path through `protocol.Diagnostic` or
+   `protocol.Mutation`. Do not introduce a plugin prefix.
 2. Write a failing unit or contract test.
 3. Implement validation and collection behind testable adapters.
 4. For diagnostics, return a normalized Result v1.
-5. For mutations, implement both `plan` and `execute`, repeat the security
-   requirements in both paths, and verify the approved plan digest.
+5. For mutations, declare security requirements once in `protocol.Risk`.
+   Keep the planner read-only and the applier behind its separate adapter; the
+   runtime normalizes and rebuilds the plan before verifying the approved
+   digest and calling the applier.
 6. Add strict configuration fields only when compiled defaults are not enough.
 7. Run race tests, vet, static Linux builds, and real-binary protocol smoke
    tests.
@@ -46,6 +49,9 @@ The binary accepts exactly:
 Unknown or duplicate keys and trailing documents are rejected. JSON is written
 only to stdout; diagnostics are written to stderr.
 
+The registry performs exact command-path dispatch and validates argument counts,
+known option names, and option value types before a domain handler runs.
+
 ## Command safety checklist
 
 - Validate paths, argument counts, flag types, ranges, identifiers, and
@@ -62,3 +68,8 @@ only to stdout; diagnostics are written to stderr.
 
 The catalog repository contains the complete authoring and publication
 examples for third-party plugin maintainers.
+
+Protocol v1 cannot sandbox arbitrary syscalls made by a trusted plugin binary.
+Plan purity is therefore enforced structurally for first-party plugins through
+separate planner/applier interfaces and tests, and remains a documented trust
+boundary for third-party executables.
