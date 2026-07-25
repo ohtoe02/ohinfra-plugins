@@ -105,6 +105,21 @@ func TestManagerUpgradePlanAndApplyAreDeterministic(t *testing.T) {
 		backend.applyCalls != 1 {
 		t.Fatalf("result=%#v applyCalls=%d", result, backend.applyCalls)
 	}
+
+	noChangePlan, err := manager.UpgradePlan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	noChange, err := manager.Upgrade(context.Background(), noChangePlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, ok := noChange.Data["operation"].(map[string]any)
+	if !ok || operation["changed"] != false ||
+		operation["reason"] != "already_converged" ||
+		len(noChange.Changes) != 0 || backend.applyCalls != 1 {
+		t.Fatalf("second result=%#v applyCalls=%d", noChange, backend.applyCalls)
+	}
 }
 
 type memoryUpgradeBackend struct {

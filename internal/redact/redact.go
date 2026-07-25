@@ -16,7 +16,7 @@ var patterns = []struct {
 	{regexp.MustCompile(`(?i)(authorization\s*:\s*bearer\s+)([^\s,;]+)`), `${1}` + Mask},
 	{regexp.MustCompile(`(?i)\b(password|passwd|pwd)(\s*[:=]\s*)([^\s&;,]+)`), `${1}${2}` + Mask},
 	{regexp.MustCompile(`\bglpat-[A-Za-z0-9_-]+\b`), `glpat-` + Mask},
-	{regexp.MustCompile(`(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token)(\s*[:=]\s*)([^\s&;,]+)`), `${1}${2}` + Mask},
+	{regexp.MustCompile(`(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|token)(\s*[:=]\s*)([^\s&;,]+)`), `${1}${2}` + Mask},
 }
 
 func String(value string) string {

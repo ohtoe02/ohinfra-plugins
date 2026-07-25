@@ -9,6 +9,7 @@ import (
 
 	dockerplugin "github.com/ohtoe02/ohtools-plugins/internal/docker"
 	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/serversetup"
 	"github.com/ohtoe02/ohtools-plugins/internal/storage"
 	"github.com/ohtoe02/ohtools-plugins/internal/system"
 	"github.com/ohtoe02/ohtools-plugins/internal/systemd"
@@ -22,6 +23,9 @@ func TestFirstPartyManifestCompatibility(t *testing.T) {
 		"storage-base": storage.NewDefinition(storage.Options{Version: "1.0.1"}),
 		"systemd-base": systemd.NewDefinition(systemd.Options{Version: "1.0.1"}),
 		"docker-base":  dockerplugin.NewDefinition(dockerplugin.Options{Version: "1.0.1"}),
+		"server-setup-base": serversetup.NewDefinition(serversetup.Options{
+			Version: "1.0.0",
+		}),
 	}
 	for name, definition := range definitions {
 		name, definition := name, definition

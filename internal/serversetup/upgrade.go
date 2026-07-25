@@ -239,20 +239,22 @@ func (manager Manager) Upgrade(
 		Config:   manager.Config,
 		Items:    []Item{ItemPackages, ItemSecurityUpdates},
 	}
-	if err := backend.ApplyUpgrade(ctx, profile, upgrades); err != nil {
-		return protocol.Normalize(protocol.Result{
-			Command: "setup upgrade", Status: protocol.StatusError,
-			Timestamp:  manager.now().Format(time.RFC3339Nano),
-			DurationMS: manager.now().Sub(started).Milliseconds(),
-			Host:       manager.Host, Tool: manager.Tool,
-			Errors: []protocol.StructuredError{{
-				Kind: protocol.ErrorGeneral, Code: "setup_upgrade_failed", Message: err.Error(),
-			}},
-		}), nil
+	if len(upgrades) > 0 {
+		if err := backend.ApplyUpgrade(ctx, profile, upgrades); err != nil {
+			return normalizeResult(protocol.Result{
+				Command: "setup upgrade", Status: protocol.StatusError,
+				Timestamp:  manager.now().Format(time.RFC3339Nano),
+				DurationMS: manager.now().Sub(started).Milliseconds(),
+				Host:       manager.Host, Tool: manager.Tool,
+				Errors: []protocol.StructuredError{{
+					Kind: protocol.ErrorGeneral, Code: "setup_upgrade_failed", Message: err.Error(),
+				}},
+			}), nil
+		}
 	}
 	remaining, err := backend.PlanUpgrade(ctx, profile)
 	if err != nil {
-		return protocol.Normalize(protocol.Result{
+		return normalizeResult(protocol.Result{
 			Command: "setup upgrade", Status: protocol.StatusPartial,
 			Timestamp:  manager.now().Format(time.RFC3339Nano),
 			DurationMS: manager.now().Sub(started).Milliseconds(),
@@ -263,7 +265,7 @@ func (manager Manager) Upgrade(
 		}), nil
 	}
 	if len(remaining) > 0 {
-		return protocol.Normalize(protocol.Result{
+		return normalizeResult(protocol.Result{
 			Command: "setup upgrade", Status: protocol.StatusPartial,
 			Timestamp:  manager.now().Format(time.RFC3339Nano),
 			DurationMS: manager.now().Sub(started).Milliseconds(),
@@ -284,7 +286,7 @@ func (manager Manager) Upgrade(
 			},
 		})
 	}
-	return protocol.Normalize(protocol.Result{
+	return normalizeResult(protocol.Result{
 		Command: "setup upgrade", Status: protocol.StatusPass,
 		Timestamp:  manager.now().Format(time.RFC3339Nano),
 		DurationMS: manager.now().Sub(started).Milliseconds(),

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/redact"
 )
 
 type Observation struct {
@@ -41,7 +42,7 @@ func (manager Manager) Check(ctx context.Context, requested []string) protocol.R
 	started := manager.now()
 	items, err := ExpandItems(requested, manager.Config)
 	if err != nil {
-		return protocol.Normalize(protocol.Result{
+		return normalizeResult(protocol.Result{
 			Command: "setup check", Status: protocol.StatusError,
 			Timestamp:  manager.now().Format(time.RFC3339Nano),
 			DurationMS: manager.now().Sub(started).Milliseconds(),
@@ -90,7 +91,7 @@ func (manager Manager) Check(ctx context.Context, requested []string) protocol.R
 			Summary: summary, Details: observation.Details,
 		})
 	}
-	return protocol.Normalize(protocol.Result{
+	return normalizeResult(protocol.Result{
 		Command: "setup check", Status: status,
 		Timestamp:  manager.now().Format(time.RFC3339Nano),
 		DurationMS: manager.now().Sub(started).Milliseconds(),
@@ -184,7 +185,7 @@ func (manager Manager) Apply(ctx context.Context, approved protocol.Plan) (proto
 			Object: string(item), Action: "converge", Status: "completed",
 		})
 	}
-	return protocol.Normalize(protocol.Result{
+	return normalizeResult(protocol.Result{
 		Command: "setup apply", Status: protocol.StatusPass,
 		Timestamp:  manager.now().Format(time.RFC3339Nano),
 		DurationMS: manager.now().Sub(started).Milliseconds(),
@@ -231,7 +232,7 @@ func (manager Manager) failure(
 	if len(completed) > 0 {
 		status = protocol.StatusPartial
 	}
-	return protocol.Normalize(protocol.Result{
+	return normalizeResult(protocol.Result{
 		Command: "setup apply", Status: status,
 		Timestamp:  manager.now().Format(time.RFC3339Nano),
 		DurationMS: manager.now().Sub(started).Milliseconds(),
@@ -242,6 +243,10 @@ func (manager Manager) failure(
 			Message: fmt.Sprintf("%s: %v", item, err),
 		}},
 	})
+}
+
+func normalizeResult(input protocol.Result) protocol.Result {
+	return redact.Result(protocol.Normalize(input))
 }
 
 func (manager Manager) now() time.Time {

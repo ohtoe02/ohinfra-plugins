@@ -16,10 +16,12 @@ do not alter operator-facing CLI paths: `docker-base`, for example, provides
 | `storage-base` | `disk` | `disk usage [path]` |
 | `systemd-base` | `service`, `logs` | `service status`, `service logs`, `service restart` |
 | `docker-base` | `docker`, `compose` | Docker diagnostics and the read-only Compose baseline |
+| `server-setup-base` | `setup` | `setup check`, `setup apply [item...]`, `setup upgrade` |
 
 `plugins.json` is the single source for CI build matrices and release tag
-authorization. `server-setup-base` is recorded there but remains release-disabled
-until its separate readiness job and domain implementation are complete.
+authorization. `server-setup-base` is release-enabled only on its completed
+implementation branch and retains a separate mandatory
+`server-setup-readiness` CI gate.
 
 The roadmap also reserves `network-base`, `postgres-base`, `k8s-base`,
 `security-base`, `apt-base`, `java-base`, `kafka-base`,

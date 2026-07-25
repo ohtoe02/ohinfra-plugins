@@ -250,11 +250,15 @@ func validateEntry(root string, entry Entry) error {
 		if statErr != nil || !info.IsDir() {
 			return fmt.Errorf("release-enabled plugin %q does not have a command directory", entry.Name)
 		}
-		if entry.ReadinessJob != "" {
-			return fmt.Errorf("release-enabled plugin %q must not declare readiness_job", entry.Name)
+		if entry.ReadinessJob != "" && !jobName.MatchString(entry.ReadinessJob) {
+			return fmt.Errorf("release-enabled plugin %q has an invalid readiness_job", entry.Name)
 		}
 	} else if !jobName.MatchString(entry.ReadinessJob) {
 		return fmt.Errorf("disabled plugin %q must declare a readiness_job", entry.Name)
+	}
+	if entry.Name == "server-setup-base" &&
+		entry.ReadinessJob != "server-setup-readiness" {
+		return errors.New("server-setup-base must retain the mandatory server-setup-readiness job")
 	}
 	return nil
 }

@@ -39,7 +39,7 @@
       "description": "Desired-state server setup and controlled upgrade operations for ohtools.",
       "homepage": "https://github.com/ohtoe02/ohtools-plugins",
       "minimum_ohtools_version": "0.3.3",
-      "release_enabled": false,
+      "release_enabled": true,
       "readiness_job": "server-setup-readiness"
     }
   ]

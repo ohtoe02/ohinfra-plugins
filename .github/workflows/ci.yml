@@ -71,20 +71,21 @@ jobs:
         with:
           go-version: "1.26.0"
           cache: true
-      - name: Run readiness suite when implementation is present
+      - name: Validate declared Debian and Ubuntu matrix
+        run: >-
+          go test -race -timeout=2m ./internal/serversetup
+          -run TestResolvePlatformAcceptsOnlyDeclaredMatrix -count=1
+      - name: Run server setup readiness suite
         shell: bash
         run: |
-          if [[ -f cmd/server-setup-base/main.go ]]; then
-            go test -race -timeout=5m ./...
-            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-              -o server-setup-base_linux_amd64 ./cmd/server-setup-base
-            file server-setup-base_linux_amd64 | grep -q "statically linked"
-            ./server-setup-base_linux_amd64 manifest --protocol=1 \
-              > server-setup-base_manifest-v1.json
-            go run ./tools/manifestcheck < server-setup-base_manifest-v1.json
-            go run ./tools/pluginregistry check-manifest \
-              server-setup-base server-setup-base_manifest-v1.json
-          else
-            echo "server-setup-base remains registry-disabled pending implementation"
-          fi
+          test -f cmd/server-setup-base/main.go
+          go test -race -timeout=5m ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -o server-setup-base_linux_amd64 ./cmd/server-setup-base
+          file server-setup-base_linux_amd64 | grep -q "statically linked"
+          ./server-setup-base_linux_amd64 manifest --protocol=1 \
+            > server-setup-base_manifest-v1.json
+          go run ./tools/manifestcheck < server-setup-base_manifest-v1.json
+          go run ./tools/pluginregistry check-manifest \
+            server-setup-base server-setup-base_manifest-v1.json
       - run: go run ./tools/pluginregistry validate

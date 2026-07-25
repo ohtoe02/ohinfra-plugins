@@ -282,6 +282,123 @@ func TestSystemBackendCreatesMissingAdministratorWithDirectArgv(t *testing.T) {
 	}
 }
 
+func TestSystemBackendRepairsOnlyMissingAdministratorGroups(t *testing.T) {
+	t.Parallel()
+
+	groups := []string{"operator", "sudo"}
+	var calls []execx.Spec
+	backend := SystemBackend{
+		Root: t.TempDir(),
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			calls = append(calls, spec)
+			switch {
+			case spec.Program == "id" && containsArgument(spec.Arguments, "-u"):
+				return execx.Output{Stdout: []byte("1000\n")}, nil
+			case spec.Program == "id" && containsArgument(spec.Arguments, "-nG"):
+				return execx.Output{Stdout: []byte(strings.Join(groups, " ") + "\n")}, nil
+			case spec.Program == "usermod":
+				groups = append(groups, "adm")
+				return execx.Output{}, nil
+			default:
+				return execx.Output{}, errors.New("unexpected command")
+			}
+		}),
+	}
+	config := DefaultConfig()
+	config.Administrators = []Administrator{{
+		Name: "operator", Groups: []string{"sudo", "adm"},
+	}}
+	profile := Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemUsers},
+	}
+	observation, err := backend.Observe(context.Background(), ItemUsers, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Converged {
+		t.Fatal("missing administrator group was reported as converged")
+	}
+	if err := backend.Apply(context.Background(), ItemUsers, profile); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Verify(context.Background(), ItemUsers, profile); err != nil {
+		t.Fatal(err)
+	}
+	var usermodCalls []execx.Spec
+	for _, call := range calls {
+		if call.Program == "usermod" {
+			usermodCalls = append(usermodCalls, call)
+		}
+	}
+	if len(usermodCalls) != 1 || !reflect.DeepEqual(
+		usermodCalls[0].Arguments,
+		[]string{"--append", "--groups", "adm", "--", "operator"},
+	) {
+		t.Fatalf("usermod calls = %#v", usermodCalls)
+	}
+}
+
+func TestSystemBackendObservesAndInstallsAuthorizedKeysUnderInjectedRoot(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	source := filepath.Join(root, "etc", "ohtools", "plugins", "keys", "operator.pub")
+	if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	key := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureKey operator@example"
+	if err := os.WriteFile(source, []byte(key+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			if spec.Program != "id" {
+				return execx.Output{}, errors.New("unexpected command")
+			}
+			if containsArgument(spec.Arguments, "-u") {
+				return execx.Output{Stdout: []byte("1000\n")}, nil
+			}
+			return execx.Output{Stdout: []byte("operator sudo\n")}, nil
+		}),
+	}
+	config := DefaultConfig()
+	config.Administrators = []Administrator{{
+		Name: "operator", Groups: []string{"sudo"},
+		AuthorizedKeySources: []string{
+			"/etc/ohtools/plugins/keys/operator.pub",
+		},
+	}}
+	profile := Profile{
+		Platform: Platform{ID: "ubuntu", Version: "24.04"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemUsers},
+	}
+	observation, err := backend.Observe(context.Background(), ItemUsers, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Converged {
+		t.Fatal("missing authorized key was reported as converged")
+	}
+	if err := backend.Apply(context.Background(), ItemUsers, profile); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Verify(context.Background(), ItemUsers, profile); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "home", "operator", ".ssh", "authorized_keys")
+	content, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != key+"\n" {
+		t.Fatalf("authorized_keys = %q", content)
+	}
+}
+
 func TestSystemBackendChecksLegacyEntitlementWithoutMutation(t *testing.T) {
 	t.Parallel()
 

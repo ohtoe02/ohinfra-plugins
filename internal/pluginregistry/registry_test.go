@@ -67,6 +67,39 @@ func TestLoadValidatesCommandsAndProducesReleaseMatrix(t *testing.T) {
 	}
 }
 
+func TestReleaseEnabledServerSetupRetainsMandatoryReadinessJob(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "cmd", "server-setup-base"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeRegistry(t, root, `{
+		"schema_version":"1",
+		"plugins":[{
+			"name":"server-setup-base",
+			"command":"./cmd/server-setup-base",
+			"description":"Server setup",
+			"homepage":"https://github.com/ohtoe02/ohtools-plugins",
+			"minimum_ohtools_version":"0.3.3",
+			"release_enabled":true,
+			"readiness_job":"server-setup-readiness"
+		}]
+	}`)
+
+	registry, err := Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.ReleaseMatrix(); len(got) != 1 || got[0] != "server-setup-base" {
+		t.Fatalf("release matrix = %#v", got)
+	}
+	if _, version, err := registry.ResolveTag("server-setup-base-v1.0.0"); err != nil ||
+		version != "1.0.0" {
+		t.Fatalf("ResolveTag() version=%q err=%v", version, err)
+	}
+}
+
 func TestLoadRejectsUnregisteredCommandAndUnknownJSON(t *testing.T) {
 	t.Parallel()
 

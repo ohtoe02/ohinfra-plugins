@@ -87,7 +87,7 @@ func (backend SystemBackend) Observe(
 	case ItemPackages:
 		return backend.observePackages(ctx, profile)
 	case ItemUsers:
-		return backend.observeUsers(profile)
+		return backend.observeUsers(ctx, profile)
 	default:
 		managed, err := backend.desiredFile(item, profile)
 		if err != nil {
@@ -348,38 +348,52 @@ func desiredPackages(profile Profile) []string {
 	return output
 }
 
-func (backend SystemBackend) observeUsers(profile Profile) (Observation, error) {
-	passwd, err := os.ReadFile(backend.path("/etc/passwd"))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return Observation{}, fmt.Errorf("read passwd: %w", err)
-	}
-	missing := []string{}
+func (backend SystemBackend) observeUsers(
+	ctx context.Context,
+	profile Profile,
+) (Observation, error) {
+	missingUsers := []string{}
+	missingGroups := map[string]any{}
+	missingKeys := []string{}
 	for _, administrator := range profile.Config.Administrators {
-		marker := []byte("\n" + administrator.Name + ":")
-		if !bytes.HasPrefix(passwd, []byte(administrator.Name+":")) &&
-			!bytes.Contains(passwd, marker) {
-			missing = append(missing, administrator.Name)
+		state, err := backend.observeAdministrator(ctx, administrator)
+		if err != nil {
+			return Observation{}, err
+		}
+		if !state.Exists {
+			missingUsers = append(missingUsers, administrator.Name)
+			continue
+		}
+		if len(state.MissingGroups) > 0 {
+			missingGroups[administrator.Name] = state.MissingGroups
+		}
+		if state.MissingAuthorizedKeys {
+			missingKeys = append(missingKeys, administrator.Name)
 		}
 	}
+	converged := len(missingUsers) == 0 && len(missingGroups) == 0 && len(missingKeys) == 0
 	return Observation{
-		Converged: len(missing) == 0,
+		Converged: converged,
 		Summary: fmt.Sprintf(
-			"%d administrator account(s), %d missing",
-			len(profile.Config.Administrators), len(missing),
+			"%d administrator account(s), %d drifted",
+			len(profile.Config.Administrators),
+			len(missingUsers)+len(missingGroups)+len(missingKeys),
 		),
-		Details: map[string]any{"missing": missing},
+		Details: map[string]any{
+			"missing_users":           missingUsers,
+			"missing_groups":          missingGroups,
+			"missing_authorized_keys": missingKeys,
+		},
 	}, nil
 }
 
 func (backend SystemBackend) applyUsers(ctx context.Context, profile Profile) error {
 	for _, administrator := range profile.Config.Administrators {
-		output, err := backend.runRaw(ctx, execx.Spec{
-			Program: "id", Arguments: []string{"-u", "--", administrator.Name},
-		})
+		state, err := backend.observeAdministrator(ctx, administrator)
 		if err != nil {
 			return err
 		}
-		if output.ExitCode != 0 {
+		if !state.Exists {
 			arguments := []string{"--create-home", "--shell", "/bin/bash"}
 			if len(administrator.Groups) > 0 {
 				groups := append([]string(nil), administrator.Groups...)
@@ -392,6 +406,16 @@ func (backend SystemBackend) applyUsers(ctx context.Context, profile Profile) er
 			}); err != nil {
 				return err
 			}
+		} else if len(state.MissingGroups) > 0 {
+			if _, err := backend.run(ctx, execx.Spec{
+				Program: "usermod",
+				Arguments: []string{
+					"--append", "--groups", strings.Join(state.MissingGroups, ","),
+					"--", administrator.Name,
+				},
+			}); err != nil {
+				return err
+			}
 		}
 		if err := backend.installAuthorizedKeys(administrator); err != nil {
 			return err
@@ -400,26 +424,101 @@ func (backend SystemBackend) applyUsers(ctx context.Context, profile Profile) er
 	return nil
 }
 
+type administratorState struct {
+	Exists                bool
+	MissingGroups         []string
+	MissingAuthorizedKeys bool
+}
+
+func (backend SystemBackend) observeAdministrator(
+	ctx context.Context,
+	administrator Administrator,
+) (administratorState, error) {
+	output, err := backend.runRaw(ctx, execx.Spec{
+		Program: "id", Arguments: []string{"-u", "--", administrator.Name},
+	})
+	if err != nil {
+		return administratorState{}, err
+	}
+	if output.ExitCode == 1 {
+		return administratorState{}, nil
+	}
+	if output.ExitCode != 0 {
+		return administratorState{}, fmt.Errorf(
+			"id exited with %d: %s",
+			output.ExitCode,
+			strings.TrimSpace(string(output.Stderr)),
+		)
+	}
+	state := administratorState{Exists: true}
+	if len(administrator.Groups) > 0 {
+		output, err = backend.runRaw(ctx, execx.Spec{
+			Program: "id", Arguments: []string{"-nG", "--", administrator.Name},
+		})
+		if err != nil {
+			return administratorState{}, err
+		}
+		if output.ExitCode != 0 {
+			return administratorState{}, fmt.Errorf(
+				"inspect groups for %s: id exited with %d",
+				administrator.Name,
+				output.ExitCode,
+			)
+		}
+		actual := map[string]bool{}
+		for _, group := range strings.Fields(string(output.Stdout)) {
+			actual[group] = true
+		}
+		for _, group := range administrator.Groups {
+			if !actual[group] {
+				state.MissingGroups = append(state.MissingGroups, group)
+			}
+		}
+		sort.Strings(state.MissingGroups)
+	}
+	if len(administrator.AuthorizedKeySources) > 0 {
+		converged, err := backend.authorizedKeysConverged(administrator)
+		if err != nil {
+			return administratorState{}, err
+		}
+		state.MissingAuthorizedKeys = !converged
+	}
+	return state, nil
+}
+
 func (backend SystemBackend) installAuthorizedKeys(administrator Administrator) error {
 	if len(administrator.AuthorizedKeySources) == 0 {
 		return nil
 	}
+	keys, err := backend.desiredAuthorizedKeys(administrator)
+	if err != nil {
+		return err
+	}
+	target := backend.path("/home/" + administrator.Name + "/.ssh/authorized_keys")
+	return backend.mergeLines(target, keys, 0o600)
+}
+
+func (backend SystemBackend) desiredAuthorizedKeys(
+	administrator Administrator,
+) ([]string, error) {
 	keys := []string{}
 	for _, source := range administrator.AuthorizedKeySources {
-		info, err := os.Lstat(source)
+		trustedPath := backend.path(source)
+		info, err := os.Lstat(trustedPath)
 		if err != nil {
-			return fmt.Errorf("inspect authorized key source: %w", err)
+			return nil, fmt.Errorf("inspect authorized key source: %w", err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() ||
-			info.Mode().Perm()&0o022 != 0 || info.Size() > 1<<20 {
-			return fmt.Errorf("authorized key source %s is unsafe", source)
+			runtime.GOOS != "windows" && info.Mode().Perm()&0o022 != 0 ||
+			info.Size() > 1<<20 {
+			return nil, fmt.Errorf("authorized key source %s is unsafe", source)
 		}
-		if err := validateTrustedKeySource(source, info); err != nil {
-			return err
+		if err := validateTrustedKeySource(trustedPath, info); err != nil {
+			return nil, err
 		}
-		content, err := os.ReadFile(source) // #nosec G304 -- validated fixed config path.
+		content, err := os.ReadFile(trustedPath) // #nosec G304 -- validated fixed config path.
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, line := range strings.Split(string(content), "\n") {
 			line = strings.TrimSpace(line)
@@ -427,14 +526,52 @@ func (backend SystemBackend) installAuthorizedKeys(administrator Administrator) 
 				continue
 			}
 			if !validPublicKey(line) {
-				return fmt.Errorf("authorized key source %s contains an invalid key", source)
+				return nil, fmt.Errorf("authorized key source %s contains an invalid key", source)
 			}
 			keys = append(keys, line)
 		}
 	}
 	sort.Strings(keys)
+	return keys, nil
+}
+
+func (backend SystemBackend) authorizedKeysConverged(
+	administrator Administrator,
+) (bool, error) {
+	desired, err := backend.desiredAuthorizedKeys(administrator)
+	if err != nil {
+		return false, err
+	}
 	target := backend.path("/home/" + administrator.Name + "/.ssh/authorized_keys")
-	return backend.mergeLines(target, keys, 0o600)
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() ||
+		info.Size() > 1<<20 ||
+		runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return false, errors.New("authorized_keys target is unsafe")
+	}
+	content, err := os.ReadFile(target) // #nosec G304 -- derived fixed user path.
+	if err != nil {
+		return false, err
+	}
+	actual := map[string]bool{}
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			actual[line] = true
+		}
+	}
+	for _, key := range desired {
+		if !actual[key] {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func validPublicKey(value string) bool {

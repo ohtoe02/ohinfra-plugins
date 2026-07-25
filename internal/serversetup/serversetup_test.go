@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -211,8 +212,73 @@ func TestCheckReportsEverySelectedItemAndTargetedRecommendations(t *testing.T) {
 	}
 }
 
+func TestApplyRedactsFailureAndReportsPartialProgress(t *testing.T) {
+	t.Parallel()
+
+	backend := &failureBackend{
+		memoryBackend: &memoryBackend{
+			drift: map[Item]bool{ItemPackages: true, ItemSysctl: true},
+		},
+		failItem: ItemSysctl,
+		failErr:  errors.New("password=hunter2 token=secret-value"),
+	}
+	manager := Manager{
+		Backend: backend, Config: DefaultConfig(),
+		Platform: Platform{ID: "debian", Version: "12"},
+		Host:     "fixture",
+		Tool:     protocol.Tool{Name: Name, Version: "1.0.0"},
+		Now:      func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
+	}
+	plan, err := manager.Plan(context.Background(), []string{"sysctl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := manager.Apply(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != protocol.StatusPartial || len(result.Changes) != 1 ||
+		len(result.Errors) != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	encoded := result.Errors[0].Message
+	if strings.Contains(encoded, "hunter2") || strings.Contains(encoded, "secret-value") {
+		t.Fatalf("secret leaked in result: %q", encoded)
+	}
+}
+
+func TestTargetedApplyDoesNotInspectOrMutateUnrelatedItems(t *testing.T) {
+	t.Parallel()
+
+	backend := &memoryBackend{
+		drift: map[Item]bool{
+			ItemPackages: true,
+			ItemSysctl:   true,
+			ItemSSH:      true,
+		},
+	}
+	manager := Manager{
+		Backend: backend, Config: DefaultConfig(),
+		Platform: Platform{ID: "ubuntu", Version: "24.04"},
+	}
+	plan, err := manager.Plan(context.Background(), []string{"sysctl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Apply(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(backend.observed, []Item{ItemPackages, ItemSysctl}) {
+		t.Fatalf("observed items = %#v", backend.observed)
+	}
+	if !reflect.DeepEqual(backend.applied, []Item{ItemPackages, ItemSysctl}) {
+		t.Fatalf("applied items = %#v", backend.applied)
+	}
+}
+
 type memoryBackend struct {
 	drift         map[Item]bool
+	observed      []Item
 	applied       []Item
 	observeCalls  int
 	entitledCalls int
@@ -230,10 +296,28 @@ func (backend *memoryBackend) Observe(
 	_ Profile,
 ) (Observation, error) {
 	backend.observeCalls++
+	backend.observed = append(backend.observed, item)
 	return Observation{
 		Converged: !backend.drift[item],
 		Summary:   string(item) + " desired state",
 	}, nil
+}
+
+type failureBackend struct {
+	*memoryBackend
+	failItem Item
+	failErr  error
+}
+
+func (backend *failureBackend) Apply(
+	ctx context.Context,
+	item Item,
+	profile Profile,
+) error {
+	if item == backend.failItem {
+		return backend.failErr
+	}
+	return backend.memoryBackend.Apply(ctx, item, profile)
 }
 
 func (backend *memoryBackend) Apply(
