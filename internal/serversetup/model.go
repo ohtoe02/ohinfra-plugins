@@ -64,9 +64,12 @@ type Administrator struct {
 }
 
 type ZabbixConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Server   string `yaml:"server"`
-	Hostname string `yaml:"hostname"`
+	Enabled                 bool   `yaml:"enabled"`
+	Server                  string `yaml:"server"`
+	Hostname                string `yaml:"hostname"`
+	RepositoryPackageURL    string `yaml:"repository_package_url"`
+	RepositoryPackageSize   int64  `yaml:"repository_package_size"`
+	RepositoryPackageSHA256 string `yaml:"repository_package_sha256"`
 }
 
 type Config struct {

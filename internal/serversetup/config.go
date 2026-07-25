@@ -1,9 +1,11 @@
 package serversetup
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path"
 	"regexp"
@@ -85,6 +87,26 @@ func ValidateConfig(config Config) error {
 		}
 		if !validHostname(config.Zabbix.Hostname) {
 			return errors.New("zabbix.hostname is invalid")
+		}
+		repositoryURL, err := url.Parse(config.Zabbix.RepositoryPackageURL)
+		if err != nil || repositoryURL.Scheme != "https" ||
+			repositoryURL.Hostname() != "repo.zabbix.com" ||
+			repositoryURL.Port() != "" || repositoryURL.User != nil ||
+			repositoryURL.RawQuery != "" || repositoryURL.Fragment != "" ||
+			!strings.HasSuffix(repositoryURL.Path, ".deb") {
+			return errors.New("zabbix.repository_package_url must be a credential-free pinned repo.zabbix.com HTTPS .deb URL")
+		}
+		if config.Zabbix.RepositoryPackageSize < 1 ||
+			config.Zabbix.RepositoryPackageSize > 50<<20 {
+			return errors.New("zabbix.repository_package_size must be within 1..52428800 bytes")
+		}
+		if len(config.Zabbix.RepositoryPackageSHA256) != 64 ||
+			strings.ToLower(config.Zabbix.RepositoryPackageSHA256) !=
+				config.Zabbix.RepositoryPackageSHA256 {
+			return errors.New("zabbix.repository_package_sha256 must be lowercase SHA-256")
+		}
+		if _, err := hex.DecodeString(config.Zabbix.RepositoryPackageSHA256); err != nil {
+			return errors.New("zabbix.repository_package_sha256 must be lowercase SHA-256")
 		}
 	}
 	return nil
