@@ -1,0 +1,100 @@
+{
+  "schema_version": "1",
+  "help_text_cases": [
+    {
+      "name": "exact UTF-8 byte boundary",
+      "unit": "é",
+      "repeat": 256,
+      "valid": true
+    },
+    {
+      "name": "UTF-8 byte overflow",
+      "unit": "é",
+      "repeat": 257,
+      "valid": false,
+      "error_contains": "512 bytes"
+    },
+    {
+      "name": "leading whitespace",
+      "unit": " leading",
+      "repeat": 1,
+      "valid": false,
+      "error_contains": "whitespace"
+    },
+    {
+      "name": "trailing whitespace",
+      "unit": "trailing ",
+      "repeat": 1,
+      "valid": false,
+      "error_contains": "whitespace"
+    },
+    {
+      "name": "C1 control",
+      "unit": "before\u0085after",
+      "repeat": 1,
+      "valid": false,
+      "error_contains": "control"
+    },
+    {
+      "name": "ANSI escape",
+      "unit": "before\u001b[31mafter",
+      "repeat": 1,
+      "valid": false,
+      "error_contains": "control"
+    }
+  ],
+  "flag_default_cases": [
+    {
+      "name": "string default",
+      "type": "string",
+      "default": "safe",
+      "valid": true
+    },
+    {
+      "name": "string rejects boolean",
+      "type": "string",
+      "default": true,
+      "valid": false,
+      "error_contains": "string"
+    },
+    {
+      "name": "boolean default",
+      "type": "bool",
+      "default": false,
+      "valid": true
+    },
+    {
+      "name": "boolean rejects string",
+      "type": "bool",
+      "default": "false",
+      "valid": false,
+      "error_contains": "boolean"
+    },
+    {
+      "name": "integer default",
+      "type": "int",
+      "default": 2,
+      "valid": true
+    },
+    {
+      "name": "integer rejects fraction",
+      "type": "int",
+      "default": 2.5,
+      "valid": false,
+      "error_contains": "integer"
+    },
+    {
+      "name": "duration default",
+      "type": "duration",
+      "default": "30s",
+      "valid": true
+    },
+    {
+      "name": "duration rejects malformed string",
+      "type": "duration",
+      "default": "soon",
+      "valid": false,
+      "error_contains": "duration"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 {
   "schema_version": "1",
   "algorithm": "sha256",
+  "canonicalization": "ohtools-plan-json-v1",
   "encoding": "UTF-8 bytes of canonical_json with no trailing newline",
   "cases": [
     {
@@ -12,6 +13,11 @@
       "name": "desired state no-op",
       "canonical_json": "{\"command_id\":\"example.write\",\"summary\":\"Example message already has the desired content\",\"checks\":[],\"changes\":[],\"risks\":[],\"requires_root\":false,\"requires_force\":false,\"requires_confirmation\":true}",
       "sha256": "7cbcba8bbdedb77318e6ab0ad510a60ebae229de18b7550a79a49efd064c4135"
+    },
+    {
+      "name": "sorted nested keys numeric and unicode values",
+      "canonical_json": "{\"command_id\":\"example.configure\",\"summary\":\"Настроить café\",\"checks\":[{\"id\":\"observed\",\"status\":\"info\",\"summary\":\"Проверено\",\"details\":{\"alpha\":1,\"middle\":1.5,\"nested\":{\"a\":null,\"β\":2},\"unicode\":\"Привет\",\"zeta\":true}}],\"changes\":[],\"risks\":[],\"requires_root\":false,\"requires_force\":false,\"requires_confirmation\":true}",
+      "sha256": "917dff1cb5a94a3a89396a8dd65858a28eb9650ddfc4a43633afd2f0a2ce2dfc"
     }
   ]
 }
