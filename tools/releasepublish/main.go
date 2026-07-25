@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,13 +12,22 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/ohtoe02/ohtools-plugins/internal/pluginregistry"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/strictjson"
 )
 
-const releasePublishTimeout = 20 * time.Minute
+const (
+	releasePublishTimeout       = 20 * time.Minute
+	maxReleaseSidecarBytes      = 32 << 20
+	maxReleaseChecksumFileBytes = 1024
+)
 
 var (
 	repositoryPattern = regexp.MustCompile(
@@ -115,6 +126,9 @@ func publishRelease(ctx context.Context, runner ghRunner, options publishOptions
 	assets, err := stageReleaseAssets(options.Assets, filepath.Join(workspace, "assets"))
 	if err != nil {
 		return err
+	}
+	if err := validateStagedArtifactSet(options, assets); err != nil {
+		return fmt.Errorf("validate staged release artifacts: %w", err)
 	}
 
 	remoteCommit, err := runner.Run(
@@ -245,6 +259,170 @@ func publishRelease(ctx context.Context, runner ghRunner, options publishOptions
 		return fmt.Errorf("verify published release: %w", err)
 	}
 	return nil
+}
+
+func validateStagedArtifactSet(options publishOptions, assets []releaseAsset) error {
+	tagSeparator := strings.LastIndex(options.Tag, "-v")
+	if tagSeparator <= 0 || tagSeparator+2 >= len(options.Tag) {
+		return errors.New("release tag does not identify a plugin and version")
+	}
+	name := options.Tag[:tagSeparator]
+	version := options.Tag[tagSeparator+2:]
+	binaryName := name + "_linux_amd64"
+	expectedNames := []string{
+		binaryName,
+		binaryName + ".sha256",
+		binaryName + ".spdx.json",
+		name + "_manifest-v1.json",
+		name + "_release-metadata-v1.json",
+	}
+	if len(assets) != len(expectedNames) {
+		return fmt.Errorf(
+			"release artifact count %d does not match required count %d",
+			len(assets),
+			len(expectedNames),
+		)
+	}
+	byName := make(map[string]releaseAsset, len(assets))
+	for _, asset := range assets {
+		byName[asset.name] = asset
+	}
+	for _, expected := range expectedNames {
+		if _, exists := byName[expected]; !exists {
+			return fmt.Errorf("required release artifact %q is missing", expected)
+		}
+	}
+
+	binary := byName[binaryName]
+	binaryFile, binaryInfo, err := openRegularNonSymlink(binary.path)
+	if err != nil {
+		return fmt.Errorf("open staged binary: %w", err)
+	}
+	hasher := sha256.New()
+	written, hashErr := io.Copy(hasher, binaryFile)
+	closeErr := binaryFile.Close()
+	if hashErr != nil {
+		return fmt.Errorf("hash staged binary: %w", hashErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close staged binary: %w", closeErr)
+	}
+	if written != binaryInfo.Size() || written != binary.size {
+		return errors.New("staged binary changed while it was hashed")
+	}
+	binarySHA := hex.EncodeToString(hasher.Sum(nil))
+
+	checksum, err := readStagedSidecar(
+		byName[binaryName+".sha256"],
+		maxReleaseChecksumFileBytes,
+	)
+	if err != nil {
+		return fmt.Errorf("read checksum sidecar: %w", err)
+	}
+	expectedChecksum := binarySHA + "  " + binaryName + "\n"
+	if string(checksum) != expectedChecksum {
+		return errors.New("checksum sidecar does not match the staged binary")
+	}
+
+	manifestJSON, err := readStagedSidecar(
+		byName[name+"_manifest-v1.json"],
+		maxReleaseSidecarBytes,
+	)
+	if err != nil {
+		return fmt.Errorf("read manifest sidecar: %w", err)
+	}
+	var manifest protocol.Manifest
+	if err := strictjson.Decode(manifestJSON, &manifest); err != nil {
+		return fmt.Errorf("decode manifest sidecar: %w", err)
+	}
+	if err := protocol.ValidateManifest(manifest); err != nil {
+		return fmt.Errorf("validate manifest sidecar: %w", err)
+	}
+	if manifest.Name != name || manifest.Version != version {
+		return errors.New("manifest sidecar identity does not match the release tag")
+	}
+
+	metadataJSON, err := readStagedSidecar(
+		byName[name+"_release-metadata-v1.json"],
+		maxReleaseSidecarBytes,
+	)
+	if err != nil {
+		return fmt.Errorf("read release metadata sidecar: %w", err)
+	}
+	var metadata pluginregistry.ReleaseMetadata
+	if err := strictjson.Decode(metadataJSON, &metadata); err != nil {
+		return fmt.Errorf("decode release metadata sidecar: %w", err)
+	}
+	expectedURL := fmt.Sprintf(
+		"https://github.com/%s/releases/download/%s/%s",
+		options.Repository,
+		options.Tag,
+		binaryName,
+	)
+	if metadata.SchemaVersion != "1" ||
+		metadata.Name != name ||
+		metadata.Version != version ||
+		metadata.Description != manifest.Description ||
+		metadata.MinimumOhtoolsVersion == "" ||
+		metadata.PublishedAt.IsZero() ||
+		metadata.Asset.OS != "linux" ||
+		metadata.Asset.Arch != "amd64" ||
+		metadata.Asset.URL != expectedURL ||
+		metadata.Asset.SHA256 != binarySHA ||
+		metadata.Asset.SizeBytes != binaryInfo.Size() ||
+		!reflect.DeepEqual(metadata.Manifest, manifest) {
+		return errors.New("release metadata does not match the staged binary and manifest")
+	}
+
+	sbomJSON, err := readStagedSidecar(
+		byName[binaryName+".spdx.json"],
+		maxReleaseSidecarBytes,
+	)
+	if err != nil {
+		return fmt.Errorf("read SPDX sidecar: %w", err)
+	}
+	var sbom map[string]any
+	if err := strictjson.Decode(sbomJSON, &sbom); err != nil {
+		return fmt.Errorf("decode SPDX sidecar: %w", err)
+	}
+	expectedNamespace := fmt.Sprintf(
+		"https://github.com/%s/releases/tag/%s/sbom/%s",
+		options.Repository,
+		options.Tag,
+		binarySHA,
+	)
+	creationInfo, creationOK := sbom["creationInfo"].(map[string]any)
+	created, createdOK := creationInfo["created"].(string)
+	if sbom["spdxVersion"] != "SPDX-2.3" ||
+		sbom["documentNamespace"] != expectedNamespace ||
+		!creationOK ||
+		!createdOK ||
+		created != metadata.PublishedAt.UTC().Format(time.RFC3339) {
+		return errors.New("SPDX sidecar does not match the staged binary and release metadata")
+	}
+	return nil
+}
+
+func readStagedSidecar(asset releaseAsset, maximum int64) ([]byte, error) {
+	if asset.size <= 0 || asset.size > maximum {
+		return nil, fmt.Errorf("sidecar size %d is outside the allowed range", asset.size)
+	}
+	file, info, err := openRegularNonSymlink(asset.path)
+	if err != nil {
+		return nil, err
+	}
+	encoded, readErr := io.ReadAll(io.LimitReader(file, maximum+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if info.Size() != asset.size || int64(len(encoded)) != asset.size {
+		return nil, errors.New("staged sidecar changed while it was read")
+	}
+	return encoded, nil
 }
 
 func verifyPublishedRelease(
@@ -505,6 +683,9 @@ func stageReleaseAssets(paths []string, destination string) ([]releaseAsset, err
 	assets := make([]releaseAsset, 0, len(paths))
 	seen := map[string]struct{}{}
 	for _, source := range paths {
+		if containsParentTraversal(source) {
+			return nil, errors.New("release asset path contains parent traversal")
+		}
 		absolute, err := filepath.Abs(source)
 		if err != nil {
 			return nil, err
@@ -530,6 +711,17 @@ func stageReleaseAssets(paths []string, destination string) ([]releaseAsset, err
 		})
 	}
 	return assets, nil
+}
+
+func containsParentTraversal(path string) bool {
+	for _, component := range strings.FieldsFunc(path, func(character rune) bool {
+		return character == '/' || character == '\\'
+	}) {
+		if component == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func copyRegularFile(source, destination string) (int64, error) {
@@ -611,6 +803,13 @@ func equalRegularFiles(leftPath, rightPath string, expectedSize int64) (bool, er
 }
 
 func openRegularNonSymlink(path string) (*os.File, os.FileInfo, error) {
+	return openRegularNonSymlinkWithOpener(path, os.Open)
+}
+
+func openRegularNonSymlinkWithOpener(
+	path string,
+	openFile func(string) (*os.File, error),
+) (*os.File, os.FileInfo, error) {
 	before, err := os.Lstat(path)
 	if err != nil {
 		return nil, nil, err
@@ -618,7 +817,7 @@ func openRegularNonSymlink(path string) (*os.File, os.FileInfo, error) {
 	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
 		return nil, nil, errors.New("path must be a regular non-symlink file")
 	}
-	file, err := os.Open(path) // #nosec G304 -- explicit CI artifact with descriptor identity checks.
+	file, err := openFile(path) // #nosec G304 -- explicit CI artifact with descriptor identity checks.
 	if err != nil {
 		return nil, nil, err
 	}

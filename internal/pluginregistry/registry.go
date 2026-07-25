@@ -133,6 +133,26 @@ func BuildReleaseMetadata(
 	assetURL string,
 	publishedAt time.Time,
 ) (ReleaseMetadata, error) {
+	return buildReleaseMetadataWithOpener(
+		entry,
+		version,
+		manifest,
+		binaryPath,
+		assetURL,
+		publishedAt,
+		os.Open,
+	)
+}
+
+func buildReleaseMetadataWithOpener(
+	entry Entry,
+	version string,
+	manifest protocol.Manifest,
+	binaryPath string,
+	assetURL string,
+	publishedAt time.Time,
+	openFile func(string) (*os.File, error),
+) (ReleaseMetadata, error) {
 	if !entry.ReleaseEnabled {
 		return ReleaseMetadata{}, fmt.Errorf("plugin %q is not release-enabled", entry.Name)
 	}
@@ -174,17 +194,35 @@ func BuildReleaseMetadata(
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() <= 0 {
 		return ReleaseMetadata{}, errors.New("release binary must be a non-empty regular non-symlink file")
 	}
-	file, err := os.Open(binaryPath)
+	file, err := openFile(binaryPath)
 	if err != nil {
 		return ReleaseMetadata{}, fmt.Errorf("open release binary: %w", err)
 	}
 	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return ReleaseMetadata{}, fmt.Errorf("inspect opened release binary: %w", err)
+	}
+	after, err := os.Lstat(binaryPath)
+	if err != nil {
+		return ReleaseMetadata{}, fmt.Errorf("reinspect release binary: %w", err)
+	}
+	if !opened.Mode().IsRegular() || opened.Size() <= 0 ||
+		after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() ||
+		!os.SameFile(info, opened) || !os.SameFile(after, opened) {
+		return ReleaseMetadata{}, errors.New("release binary changed while it was being opened")
+	}
 	hasher := sha256.New()
 	written, err := io.Copy(hasher, file)
 	if err != nil {
 		return ReleaseMetadata{}, fmt.Errorf("hash release binary: %w", err)
 	}
-	if written != info.Size() {
+	if written != opened.Size() {
+		return ReleaseMetadata{}, errors.New("release binary changed while it was being hashed")
+	}
+	final, err := os.Lstat(binaryPath)
+	if err != nil || final.Mode()&os.ModeSymlink != 0 || !final.Mode().IsRegular() ||
+		!os.SameFile(final, opened) {
 		return ReleaseMetadata{}, errors.New("release binary changed while it was being hashed")
 	}
 
@@ -198,7 +236,7 @@ func BuildReleaseMetadata(
 		PublishedAt:           publishedAt.UTC(),
 		Asset: ReleaseAsset{
 			OS: "linux", Arch: "amd64", URL: assetURL,
-			SHA256: hex.EncodeToString(hasher.Sum(nil)), SizeBytes: info.Size(),
+			SHA256: hex.EncodeToString(hasher.Sum(nil)), SizeBytes: opened.Size(),
 		},
 		Manifest: manifest,
 	}, nil
@@ -257,9 +295,15 @@ func validateEntry(root string, entry Entry) error {
 		return fmt.Errorf("plugin %q has an invalid minimum_ohtools_version", entry.Name)
 	}
 	commandPath := filepath.Join(root, "cmd", entry.Name)
-	info, statErr := os.Stat(commandPath)
+	info, statErr := os.Lstat(commandPath)
 	if entry.ReleaseEnabled {
-		if statErr != nil || !info.IsDir() {
+		if statErr != nil {
+			return fmt.Errorf("release-enabled plugin %q does not have a command directory", entry.Name)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("release-enabled plugin %q command directory must not be a symlink", entry.Name)
+		}
+		if !info.IsDir() {
 			return fmt.Errorf("release-enabled plugin %q does not have a command directory", entry.Name)
 		}
 		if entry.ReadinessJob != "" {

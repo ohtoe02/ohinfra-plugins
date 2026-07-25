@@ -13,8 +13,11 @@ Each plugin is versioned independently.
    unpublished draft whose tag and target commit match exactly. Existing assets
    are downloaded and compared byte-for-byte, unexpected or mismatched assets
    fail closed, and only missing assets are uploaded without clobbering. Every
-   asset is downloaded and verified again before the draft is published. An
-   existing published release always fails.
+   asset is downloaded and verified again before the draft is published. A
+   retry against an already-published release is a successful immutable no-op
+   only when the tag commit and complete asset set match the staged bytes
+   exactly. An incomplete release, unexpected asset, byte mismatch, or target
+   mismatch fails closed without modifying the published release.
    Build and publication timestamps come from the immutable tag commit, and the
    SPDX creation time and namespace are normalized deterministically, so a retry
    rebuilds the same bytes.
