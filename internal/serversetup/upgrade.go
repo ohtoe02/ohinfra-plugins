@@ -37,13 +37,7 @@ func (backend SystemBackend) PlanUpgrade(
 	ctx context.Context,
 	_ Profile,
 ) ([]PackageUpgrade, error) {
-	var upgrades []PackageUpgrade
-	err := backend.withIsolatedAPT(ctx, func(options []string) error {
-		var err error
-		upgrades, err = backend.planUpgradeWithAPTOptions(ctx, options)
-		return err
-	})
-	return upgrades, err
+	return backend.planUpgradeReadOnly(ctx)
 }
 
 func (backend SystemBackend) ApplyUpgrade(
@@ -104,6 +98,26 @@ func (backend SystemBackend) planUpgradeWithAPTOptions(
 	return parsePackageUpgrades(output.Stdout)
 }
 
+func (backend SystemBackend) planUpgradeReadOnly(
+	ctx context.Context,
+) ([]PackageUpgrade, error) {
+	output, err := backend.run(ctx, execx.Spec{
+		Program: "apt-get",
+		Arguments: []string{
+			"--simulate",
+			"upgrade",
+			"--with-new-pkgs",
+			"-o",
+			"Debug::NoLocking=true",
+		},
+		Environment: map[string]string{"DEBIAN_FRONTEND": "noninteractive"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parsePackageUpgrades(output.Stdout)
+}
+
 func (backend SystemBackend) VerifyUpgrades(
 	ctx context.Context,
 	_ Profile,
@@ -156,11 +170,21 @@ func (backend SystemBackend) withIsolatedAPT(
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return errors.New("trusted temporary directory is unsafe")
 	}
-	if err := validateManagedPath(base, info, true, backend.Root != ""); err != nil {
+	allowStickyRootTemp := backend.Root == "" &&
+		filepath.Clean(base) == filepath.Clean("/tmp")
+	if err := validateManagedPath(
+		base,
+		info,
+		true,
+		backend.Root != "" || allowStickyRootTemp,
+	); err != nil {
 		return err
 	}
 	runDirectory, err := os.MkdirTemp(base, "ohtools-server-setup-apt-")
 	if err != nil {
+		return err
+	}
+	if err := os.Chmod(runDirectory, 0o700); err != nil {
 		return err
 	}
 	defer func() {

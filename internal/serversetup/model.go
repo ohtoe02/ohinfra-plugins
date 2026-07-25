@@ -11,7 +11,7 @@ import (
 
 const (
 	Name        = "server-setup-base"
-	Description = "Idempotent Debian and Ubuntu server setup checks, apply, and upgrade operations."
+	Description = "Desired-state server setup and controlled upgrade operations for ohtools."
 	ConfigPath  = "/etc/ohtools/plugins/server-setup-base.yaml"
 )
 

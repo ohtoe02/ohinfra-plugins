@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 
 	"github.com/ohtoe02/ohtools-plugins/internal/execx"
@@ -15,19 +16,24 @@ import (
 )
 
 type Report struct {
-	SchemaVersion        string               `json:"schema_version"`
-	Platform             serversetup.Platform `json:"platform"`
-	InitialApplyStatus   protocol.Status      `json:"initial_apply_status"`
-	InitialApplyChanges  int                  `json:"initial_apply_changes"`
-	SecondApplyStatus    protocol.Status      `json:"second_apply_status"`
-	SecondApplyChanges   int                  `json:"second_apply_changes"`
-	DriftRepairStatus    protocol.Status      `json:"drift_repair_status"`
-	DriftRepairChanges   int                  `json:"drift_repair_changes"`
-	UpgradeStatus        protocol.Status      `json:"upgrade_status"`
-	UpgradeChanges       int                  `json:"upgrade_changes"`
-	SecondUpgradeStatus  protocol.Status      `json:"second_upgrade_status"`
-	SecondUpgradeChanges int                  `json:"second_upgrade_changes"`
-	ExactUpgradeApplied  bool                 `json:"exact_upgrade_applied"`
+	SchemaVersion            string               `json:"schema_version"`
+	Platform                 serversetup.Platform `json:"platform"`
+	InitialApplyStatus       protocol.Status      `json:"initial_apply_status"`
+	InitialApplyChanges      int                  `json:"initial_apply_changes"`
+	SecondApplyStatus        protocol.Status      `json:"second_apply_status"`
+	SecondApplyChanges       int                  `json:"second_apply_changes"`
+	DriftRepairStatus        protocol.Status      `json:"drift_repair_status"`
+	DriftRepairChanges       int                  `json:"drift_repair_changes"`
+	UpgradeStatus            protocol.Status      `json:"upgrade_status"`
+	UpgradeChanges           int                  `json:"upgrade_changes"`
+	SecondUpgradeStatus      protocol.Status      `json:"second_upgrade_status"`
+	SecondUpgradeChanges     int                  `json:"second_upgrade_changes"`
+	ExactUpgradeApplied      bool                 `json:"exact_upgrade_applied"`
+	SystemApplyStatus        protocol.Status      `json:"system_apply_status"`
+	SystemApplyChanges       int                  `json:"system_apply_changes"`
+	SystemSecondApplyStatus  protocol.Status      `json:"system_second_apply_status"`
+	SystemSecondApplyChanges int                  `json:"system_second_apply_changes"`
+	DependencyProbesPassed   bool                 `json:"dependency_probes_passed"`
 }
 
 func Run(ctx context.Context, osRelease []byte, root string) (Report, error) {
@@ -100,25 +106,149 @@ func Run(ctx context.Context, osRelease []byte, root string) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
+	systemInitial, systemSecond, err := exerciseSafeSystemBackend(
+		ctx,
+		platform,
+		root,
+	)
+	if err != nil {
+		return Report{}, err
+	}
+	dependencyProbesPassed, err := probeRuntimeDependencies()
+	if err != nil {
+		return Report{}, err
+	}
 	report := Report{
-		SchemaVersion:        "1",
-		Platform:             platform,
-		InitialApplyStatus:   initial.Status,
-		InitialApplyChanges:  len(initial.Changes),
-		SecondApplyStatus:    second.Status,
-		SecondApplyChanges:   len(second.Changes),
-		DriftRepairStatus:    drift.Status,
-		DriftRepairChanges:   len(drift.Changes),
-		UpgradeStatus:        upgrade.Status,
-		UpgradeChanges:       len(upgrade.Changes),
-		SecondUpgradeStatus:  secondUpgrade.Status,
-		SecondUpgradeChanges: len(secondUpgrade.Changes),
-		ExactUpgradeApplied:  backend.exactUpgradeApplied && safeSystemUpgrade,
+		SchemaVersion:            "1",
+		Platform:                 platform,
+		InitialApplyStatus:       initial.Status,
+		InitialApplyChanges:      len(initial.Changes),
+		SecondApplyStatus:        second.Status,
+		SecondApplyChanges:       len(second.Changes),
+		DriftRepairStatus:        drift.Status,
+		DriftRepairChanges:       len(drift.Changes),
+		UpgradeStatus:            upgrade.Status,
+		UpgradeChanges:           len(upgrade.Changes),
+		SecondUpgradeStatus:      secondUpgrade.Status,
+		SecondUpgradeChanges:     len(secondUpgrade.Changes),
+		ExactUpgradeApplied:      backend.exactUpgradeApplied && safeSystemUpgrade,
+		SystemApplyStatus:        systemInitial.Status,
+		SystemApplyChanges:       len(systemInitial.Changes),
+		SystemSecondApplyStatus:  systemSecond.Status,
+		SystemSecondApplyChanges: len(systemSecond.Changes),
+		DependencyProbesPassed:   dependencyProbesPassed,
 	}
 	if err := ValidateReport(report, platform.ID, platform.Version); err != nil {
 		return Report{}, err
 	}
 	return report, nil
+}
+
+func exerciseSafeSystemBackend(
+	ctx context.Context,
+	platform serversetup.Platform,
+	root string,
+) (protocol.Result, protocol.Result, error) {
+	systemRoot := filepath.Join(root, "system-apply-backend")
+	if err := os.Mkdir(systemRoot, 0o700); err != nil {
+		return protocol.Result{}, protocol.Result{}, err
+	}
+	if platform.ID == "debian" && platform.RequiresExtendedSupport {
+		source := filepath.Join(
+			systemRoot,
+			"etc",
+			"apt",
+			"sources.list.d",
+			"extended-lts.list",
+		)
+		if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+			return protocol.Result{}, protocol.Result{}, err
+		}
+		if err := os.WriteFile(
+			source,
+			[]byte("deb https://deb.freexian.com/extended-lts buster-lts main\n"),
+			0o644,
+		); err != nil {
+			return protocol.Result{}, protocol.Result{}, err
+		}
+	}
+	configPath := filepath.Join(systemRoot, "server-setup-base.yaml")
+	if err := os.WriteFile(configPath, []byte(
+		"enabled_items: [packages, shell-history]\n"+
+			"packages: []\n"+
+			"administrators: []\n"+
+			"ssh_port: 22\n"+
+			"manage_firewall: false\n",
+	), 0o600); err != nil {
+		return protocol.Result{}, protocol.Result{}, err
+	}
+	backend := serversetup.SystemBackend{
+		Root: systemRoot,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			switch spec.Program {
+			case "dpkg-query":
+				return execx.Output{
+					Stdout: []byte("sudo\tinstall ok installed\n"),
+				}, nil
+			case "pro":
+				return execx.Output{Stdout: []byte(`{"attached":true}`)}, nil
+			default:
+				return execx.Output{}, fmt.Errorf(
+					"unexpected safe system backend command %s",
+					spec.Program,
+				)
+			}
+		}),
+	}
+	definition := serversetup.NewDefinition(serversetup.Options{
+		Version: "1.0.0", ConfigPath: configPath,
+		Platform: &platform, Backend: backend, Host: "readiness-system-backend",
+	})
+	invocation := protocol.Invocation{
+		ProtocolVersion: protocol.ProtocolVersion,
+		RequestID:       "readiness-system-apply",
+		CommandPath:     []string{"setup", "apply"},
+		Arguments:       []string{"shell-history"},
+		Options:         map[string]any{},
+	}
+	initial, err := planAndExecute(ctx, definition, invocation)
+	if err != nil {
+		return protocol.Result{}, protocol.Result{}, err
+	}
+	invocation.RequestID = "readiness-system-apply-second"
+	second, err := planAndExecute(ctx, definition, invocation)
+	if err != nil {
+		return protocol.Result{}, protocol.Result{}, err
+	}
+	if _, err := os.Stat(filepath.Join(
+		systemRoot,
+		"etc",
+		"profile.d",
+		"ohtools-server-setup-history.sh",
+	)); err != nil {
+		return protocol.Result{}, protocol.Result{}, err
+	}
+	return initial, second, nil
+}
+
+func probeRuntimeDependencies() (bool, error) {
+	if runtime.GOOS != "linux" {
+		return true, nil
+	}
+	for _, dependency := range []string{
+		"/bin/sh",
+		"/usr/bin/apt-get",
+		"/usr/bin/dpkg-query",
+	} {
+		info, err := os.Stat(dependency)
+		if err != nil {
+			return false, fmt.Errorf("probe runtime dependency %s: %w", dependency, err)
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			return false, fmt.Errorf("runtime dependency %s is not executable", dependency)
+		}
+	}
+	return true, nil
 }
 
 func exerciseSafeSystemUpgrade(
@@ -152,8 +282,19 @@ func exerciseSafeSystemUpgrade(
 		return false, err
 	}
 	installCalls := 0
-	for _, call := range calls {
-		if call.Program != "apt-get" || !hasIsolatedAPTOptions(call.Arguments) {
+	for index, call := range calls {
+		if call.Program != "apt-get" {
+			return false, errors.New("system upgrade fixture invoked a foreign program")
+		}
+		if index == 0 {
+			if !contains(call.Arguments, "--simulate") ||
+				!contains(call.Arguments, "Debug::NoLocking=true") ||
+				hasIsolatedAPTOptions(call.Arguments) {
+				return false, errors.New("system upgrade planning was not read-only")
+			}
+			continue
+		}
+		if !hasIsolatedAPTOptions(call.Arguments) {
 			return false, errors.New("system upgrade fixture escaped isolated APT options")
 		}
 		for _, argument := range call.Arguments {
@@ -203,11 +344,13 @@ func ValidateReport(report Report, expectedID string, expectedVersion string) er
 		return errors.New("readiness report platform or schema mismatch")
 	}
 	for name, status := range map[string]protocol.Status{
-		"initial apply":  report.InitialApplyStatus,
-		"second apply":   report.SecondApplyStatus,
-		"drift repair":   report.DriftRepairStatus,
-		"upgrade":        report.UpgradeStatus,
-		"second upgrade": report.SecondUpgradeStatus,
+		"initial apply":       report.InitialApplyStatus,
+		"second apply":        report.SecondApplyStatus,
+		"drift repair":        report.DriftRepairStatus,
+		"upgrade":             report.UpgradeStatus,
+		"second upgrade":      report.SecondUpgradeStatus,
+		"system apply":        report.SystemApplyStatus,
+		"system second apply": report.SystemSecondApplyStatus,
 	} {
 		if status != protocol.StatusPass {
 			return fmt.Errorf("%s status is %s", name, status)
@@ -218,7 +361,10 @@ func ValidateReport(report Report, expectedID string, expectedVersion string) er
 		report.DriftRepairChanges != 1 ||
 		report.UpgradeChanges == 0 ||
 		report.SecondUpgradeChanges != 0 ||
-		!report.ExactUpgradeApplied {
+		!report.ExactUpgradeApplied ||
+		report.SystemApplyChanges == 0 ||
+		report.SystemSecondApplyChanges != 0 ||
+		!report.DependencyProbesPassed {
 		return errors.New("readiness report does not prove idempotency and drift repair")
 	}
 	return nil

@@ -13,8 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ohtoe02/ohtools-plugins/internal/execx"
 )
@@ -87,6 +89,10 @@ func TestManagedItemsRequirePersistentAndEffectiveConvergence(t *testing.T) {
 				Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
 					if spec.Program == "sysctl" {
 						return execx.Output{Stdout: []byte("0\n0\n0\n0\n")}, nil
+					}
+					if spec.Program == "systemctl" &&
+						containsArgument(spec.Arguments, "is-active") {
+						return execx.Output{ExitCode: 3}, nil
 					}
 					return execx.Output{ExitCode: 1}, nil
 				}),
@@ -287,6 +293,13 @@ func TestSystemBackendFailsClosedOnStaleManagedTransactionArtifact(t *testing.T)
 	if err := os.WriteFile(target+".rollback", []byte("# previous\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(
+		target+".transaction-v1.json",
+		[]byte("{\"schema_version\":\"1\",\"phase\":\"unknown\",\"had_target\":true}\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
 	_, err = backend.Observe(context.Background(), ItemSysctl, Profile{
 		Platform: Platform{ID: "debian", Version: "12"},
 		Config:   DefaultConfig(),
@@ -382,6 +395,157 @@ func TestSystemBackendRecoversInterruptedManagedTransactionsBeforeRetry(t *testi
 				}
 			}
 		})
+	}
+}
+
+func TestSystemBackendObserveRepresentsRecoverableManagedTransactionAsDrift(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	backend := SystemBackend{Root: root, Runner: successfulRunner()}
+	profile := Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   DefaultConfig(),
+		Items:    []Item{ItemPackages, ItemSysctl},
+	}
+	managed, err := backend.desiredFile(ItemSysctl, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := backend.path(managed.Path)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, managed.Content, managed.Mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target+".rollback", []byte("# previous\n"), managed.Mode); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := target + ".transaction-v1.json"
+	if err := os.WriteFile(
+		journalPath,
+		[]byte("{\"schema_version\":\"1\",\"phase\":\"activated\",\"had_target\":true}\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	observation, err := backend.Observe(context.Background(), ItemSysctl, profile)
+	if err != nil {
+		t.Fatalf("recoverable transaction blocked planning: %v", err)
+	}
+	if observation.Converged {
+		t.Fatal("recoverable transaction was reported as converged")
+	}
+	if _, err := os.Lstat(journalPath); err != nil {
+		t.Fatalf("read-only observation mutated recovery journal: %v", err)
+	}
+}
+
+func TestManagedRecoveryValidationRejectsImpossibleArtifactCombinations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		journal  managedTransactionJournal
+		target   bool
+		stage    bool
+		rollback bool
+	}{
+		{
+			name: "staged old target without stage",
+			journal: managedTransactionJournal{
+				Phase: "staged", HadTarget: true,
+			},
+			target: true,
+		},
+		{
+			name: "backed up transaction without stage or activated target",
+			journal: managedTransactionJournal{
+				Phase: "backed_up", HadTarget: true,
+			},
+			rollback: true,
+		},
+		{
+			name: "activated transaction retains stage",
+			journal: managedTransactionJournal{
+				Phase: "activated", HadTarget: false,
+			},
+			target: true,
+			stage:  true,
+		},
+		{
+			name: "rolling back transaction retains stage",
+			journal: managedTransactionJournal{
+				Phase: "rolling_back", HadTarget: false,
+			},
+			stage: true,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if err := validateManagedRecoveryState(
+				test.journal,
+				test.target,
+				test.stage,
+				test.rollback,
+			); err == nil {
+				t.Fatal("impossible managed recovery state was accepted")
+			}
+		})
+	}
+}
+
+func TestSystemBackendObserveRepresentsRecoverableSSHIncludeAsDrift(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	backend := SystemBackend{Root: root}
+	target := backend.path("/etc/ssh/sshd_config")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(sshIncludeDirective+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backup := target + ".ohtools-include.rollback"
+	if err := os.WriteFile(backup, []byte("# original\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	present, err := backend.sshIncludePresent()
+	if err != nil {
+		t.Fatalf("recoverable SSH transaction blocked planning: %v", err)
+	}
+	if present {
+		t.Fatal("interrupted SSH include transaction was reported as converged")
+	}
+	if _, err := os.Lstat(backup); err != nil {
+		t.Fatalf("read-only SSH observation mutated rollback artifact: %v", err)
+	}
+}
+
+func TestSSHIncludeRecoveryRejectsImpossibleArtifactCombination(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	backend := SystemBackend{Root: root}
+	target := backend.path("/etc/ssh/sshd_config")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		target+".ohtools-include.stage",
+		[]byte(sshIncludeDirective+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.sshIncludeRecoveryPending(target); err == nil {
+		t.Fatal("orphaned SSH include stage without original or rollback was accepted")
 	}
 }
 
@@ -499,10 +663,24 @@ func TestSystemBackendUsesDirectPackageArgv(t *testing.T) {
 	t.Parallel()
 
 	var calls []execx.Spec
+	installed := map[string]bool{}
 	backend := SystemBackend{
 		Root: t.TempDir(),
 		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
 			calls = append(calls, spec)
+			if spec.Program == "dpkg-query" {
+				var output strings.Builder
+				for name := range installed {
+					fmt.Fprintf(&output, "%s\tinstall ok installed\n", name)
+				}
+				return execx.Output{ExitCode: 1, Stdout: []byte(output.String())}, nil
+			}
+			if spec.Program == "apt-get" && containsArgument(spec.Arguments, "install") {
+				separator := slices.Index(spec.Arguments, "--")
+				for _, name := range spec.Arguments[separator+1:] {
+					installed[name] = true
+				}
+			}
 			return execx.Output{}, nil
 		}),
 	}
@@ -516,19 +694,67 @@ func TestSystemBackendUsesDirectPackageArgv(t *testing.T) {
 	if err := backend.Apply(context.Background(), ItemPackages, profile); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 2 {
+	if len(calls) != 4 {
 		t.Fatalf("calls = %#v", calls)
 	}
-	if calls[0].Program != "apt-get" || !reflect.DeepEqual(calls[0].Arguments, []string{"update"}) {
-		t.Fatalf("apt update = %#v", calls[0])
+	if calls[1].Program != "apt-get" || !reflect.DeepEqual(calls[1].Arguments, []string{"update"}) {
+		t.Fatalf("apt update = %#v", calls[1])
 	}
-	install := calls[1]
+	install := calls[2]
 	if install.Program != "apt-get" || !reflect.DeepEqual(install.Arguments,
-		[]string{"install", "-y", "--no-install-recommends", "--", "curl", "openssh-server", "sudo"}) {
+		[]string{"install", "-y", "--no-install-recommends", "--no-upgrade", "--", "curl", "openssh-server", "sudo"}) {
 		t.Fatalf("apt install = %#v", install)
 	}
 	if len(install.Environment) == 0 || install.Environment["DEBIAN_FRONTEND"] != "noninteractive" {
 		t.Fatalf("apt environment = %#v", install.Environment)
+	}
+}
+
+func TestSystemBackendInstallsOnlyMissingPackagesWithoutUpgradingInstalledOnes(t *testing.T) {
+	t.Parallel()
+
+	installed := map[string]bool{"curl": true}
+	var install []string
+	backend := SystemBackend{
+		Root: t.TempDir(),
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			switch spec.Program {
+			case "dpkg-query":
+				var output strings.Builder
+				for name := range installed {
+					if installed[name] {
+						fmt.Fprintf(&output, "%s\tinstall ok installed\n", name)
+					}
+				}
+				return execx.Output{ExitCode: 1, Stdout: []byte(output.String())}, nil
+			case "apt-get":
+				if containsArgument(spec.Arguments, "install") {
+					install = append([]string(nil), spec.Arguments...)
+					installed["vim"] = true
+				}
+				return execx.Output{}, nil
+			default:
+				return execx.Output{}, fmt.Errorf("unexpected program %s", spec.Program)
+			}
+		}),
+	}
+	config := DefaultConfig()
+	config.Packages = []string{"curl", "vim"}
+	profile := Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages},
+	}
+
+	if err := backend.Apply(context.Background(), ItemPackages, profile); err != nil {
+		t.Fatal(err)
+	}
+	if !containsArgument(install, "--no-upgrade") {
+		t.Fatalf("package install may upgrade existing packages: %#v", install)
+	}
+	separator := slices.Index(install, "--")
+	if separator < 0 || !reflect.DeepEqual(install[separator+1:], []string{"vim"}) {
+		t.Fatalf("package install targets = %#v, want only vim", install)
 	}
 }
 
@@ -538,6 +764,7 @@ func TestSystemBackendVerifiesPinnedZabbixRepositoryPackage(t *testing.T) {
 	content := []byte("repo-pkg")
 	digest := fmt.Sprintf("%x", sha256.Sum256(content))
 	var calls []execx.Spec
+	installed := map[string]bool{}
 	backend := SystemBackend{
 		Root: t.TempDir(),
 		HTTPClient: httpDoerFunc(func(request *http.Request) (*http.Response, error) {
@@ -553,6 +780,20 @@ func TestSystemBackendVerifiesPinnedZabbixRepositoryPackage(t *testing.T) {
 		}),
 		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
 			calls = append(calls, spec)
+			switch spec.Program {
+			case "dpkg-query":
+				var output strings.Builder
+				for name := range installed {
+					fmt.Fprintf(&output, "%s\tinstall ok installed\n", name)
+				}
+				return execx.Output{ExitCode: 1, Stdout: []byte(output.String())}, nil
+			case "dpkg":
+				installed["zabbix-release"] = true
+			case "apt-get":
+				if containsArgument(spec.Arguments, "install") {
+					installed["zabbix-agent2"] = true
+				}
+			}
 			return execx.Output{}, nil
 		}),
 	}
@@ -571,15 +812,16 @@ func TestSystemBackendVerifiesPinnedZabbixRepositoryPackage(t *testing.T) {
 	if err := backend.Apply(context.Background(), ItemPackages, profile); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 4 || calls[0].Program != "dpkg-query" ||
+	if len(calls) != 6 || calls[0].Program != "dpkg-query" ||
 		calls[1].Program != "dpkg" ||
 		!reflect.DeepEqual(calls[1].Arguments[:2], []string{"--install", "--"}) ||
-		calls[2].Program != "apt-get" || calls[3].Program != "apt-get" {
+		calls[3].Program != "apt-get" || calls[4].Program != "apt-get" {
 		t.Fatalf("calls = %#v", calls)
 	}
 
 	config.Zabbix.RepositoryPackageSHA256 = strings.Repeat("0", 64)
 	calls = nil
+	installed = map[string]bool{}
 	if err := backend.Apply(context.Background(), ItemPackages, Profile{
 		Platform: profile.Platform, Config: config, Items: profile.Items,
 	}); err == nil {
@@ -595,6 +837,7 @@ func TestSystemBackendDoesNotReinstallPinnedZabbixRepositoryPackage(t *testing.T
 
 	downloads := 0
 	var calls []execx.Spec
+	installed := map[string]bool{"zabbix-release": true}
 	backend := SystemBackend{
 		Root: t.TempDir(),
 		HTTPClient: httpDoerFunc(func(*http.Request) (*http.Response, error) {
@@ -604,9 +847,14 @@ func TestSystemBackendDoesNotReinstallPinnedZabbixRepositoryPackage(t *testing.T
 		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
 			calls = append(calls, spec)
 			if spec.Program == "dpkg-query" {
-				return execx.Output{
-					Stdout: []byte("zabbix-release\tinstall ok installed\n"),
-				}, nil
+				var output strings.Builder
+				for name := range installed {
+					fmt.Fprintf(&output, "%s\tinstall ok installed\n", name)
+				}
+				return execx.Output{ExitCode: 1, Stdout: []byte(output.String())}, nil
+			}
+			if spec.Program == "apt-get" && containsArgument(spec.Arguments, "install") {
+				installed["zabbix-agent2"] = true
 			}
 			return execx.Output{}, nil
 		}),
@@ -625,10 +873,10 @@ func TestSystemBackendDoesNotReinstallPinnedZabbixRepositoryPackage(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if downloads != 0 || len(calls) != 3 ||
+	if downloads != 0 || len(calls) != 5 ||
 		calls[0].Program != "dpkg-query" ||
-		calls[1].Program != "apt-get" ||
-		calls[2].Program != "apt-get" {
+		calls[2].Program != "apt-get" ||
+		calls[3].Program != "apt-get" {
 		t.Fatalf("downloads=%d calls=%#v", downloads, calls)
 	}
 }
@@ -661,6 +909,136 @@ func TestSystemBackendTreatsMissingPackagesAsDrift(t *testing.T) {
 	if observation.Converged ||
 		!reflect.DeepEqual(observation.Details["missing"], []string{"vim"}) {
 		t.Fatalf("observation = %#v", observation)
+	}
+}
+
+func TestSystemBackendRepairsAndRollsBackServiceState(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	enabled := false
+	active := false
+	var actions []string
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			if spec.Program == "fail2ban-client" {
+				if active {
+					return execx.Output{}, nil
+				}
+				return execx.Output{ExitCode: 1}, nil
+			}
+			if spec.Program != "systemctl" {
+				return execx.Output{}, errors.New("unexpected program")
+			}
+			switch {
+			case containsArgument(spec.Arguments, "is-enabled"):
+				if enabled {
+					return execx.Output{}, nil
+				}
+				return execx.Output{ExitCode: 1}, nil
+			case containsArgument(spec.Arguments, "is-active"):
+				if active {
+					return execx.Output{}, nil
+				}
+				return execx.Output{ExitCode: 3}, nil
+			case containsArgument(spec.Arguments, "enable"):
+				actions = append(actions, "enable")
+				enabled = true
+			case containsArgument(spec.Arguments, "start"):
+				actions = append(actions, "start")
+				active = true
+			case containsArgument(spec.Arguments, "reload"):
+				actions = append(actions, "reload")
+				if len(actions) == 3 {
+					return execx.Output{ExitCode: 1}, nil
+				}
+			case containsArgument(spec.Arguments, "disable"):
+				actions = append(actions, "disable")
+				enabled = false
+			case containsArgument(spec.Arguments, "stop"):
+				actions = append(actions, "stop")
+				active = false
+			}
+			return execx.Output{}, nil
+		}),
+	}
+	err := backend.Apply(context.Background(), ItemFail2Ban, Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   DefaultConfig(),
+		Items:    []Item{ItemPackages, ItemFail2Ban},
+	})
+	if err == nil {
+		t.Fatal("failed service activation was accepted")
+	}
+	if enabled || active {
+		t.Fatalf("service state was not restored: enabled=%v active=%v", enabled, active)
+	}
+	if !reflect.DeepEqual(
+		actions,
+		[]string{"enable", "start", "reload", "reload", "stop", "disable"},
+	) {
+		t.Fatalf("service actions = %#v", actions)
+	}
+}
+
+func TestSystemBackendRepairsDisabledActiveService(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	enabled := false
+	var actions []string
+	backend := SystemBackend{Root: root}
+	profile := Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   DefaultConfig(),
+		Items:    []Item{ItemPackages, ItemFail2Ban},
+	}
+	managed, err := backend.desiredFile(ItemFail2Ban, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := backend.path(managed.Path)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, managed.Content, managed.Mode); err != nil {
+		t.Fatal(err)
+	}
+	backend.Runner = execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+		switch {
+		case spec.Program == "fail2ban-client":
+			return execx.Output{}, nil
+		case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-enabled"):
+			if enabled {
+				return execx.Output{}, nil
+			}
+			return execx.Output{ExitCode: 1}, nil
+		case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-active"):
+			return execx.Output{}, nil
+		case spec.Program == "systemctl" && containsArgument(spec.Arguments, "enable"):
+			enabled = true
+			actions = append(actions, "enable")
+			return execx.Output{}, nil
+		case spec.Program == "systemctl" && containsArgument(spec.Arguments, "reload"):
+			actions = append(actions, "reload")
+			return execx.Output{}, nil
+		default:
+			return execx.Output{}, errors.New("unexpected command")
+		}
+	})
+	observation, err := backend.Observe(context.Background(), ItemFail2Ban, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Converged {
+		t.Fatal("disabled managed service was reported as converged")
+	}
+	if err := backend.Apply(context.Background(), ItemFail2Ban, profile); err != nil {
+		t.Fatal(err)
+	}
+	if !enabled || !reflect.DeepEqual(actions, []string{"enable", "reload"}) {
+		t.Fatalf("enabled=%v actions=%#v", enabled, actions)
 	}
 }
 
@@ -1106,7 +1484,10 @@ func TestFirewallRollbackRestoresActiveRulesAndEnablement(t *testing.T) {
 				return execx.Output{}, nil
 			case spec.Program == "nft" && containsArgument(spec.Arguments, "-f"):
 				if len(spec.Stdin) > 0 {
-					activeRules = append([]byte(nil), spec.Stdin...)
+					activeRules = append([]byte(nil), bytes.TrimPrefix(
+						spec.Stdin,
+						[]byte("delete table inet ohtools_server_setup\n"),
+					)...)
 					return execx.Output{}, nil
 				}
 				return execx.Output{}, errors.New("nft restore path is missing")
@@ -1211,11 +1592,134 @@ func TestFirewallRollbackUsesIndependentBoundedContext(t *testing.T) {
 	if err := backend.Apply(ctx, ItemFirewall, newProfile); err == nil {
 		t.Fatal("canceled firewall restart was accepted")
 	}
-	if rollbackCalls != 4 {
-		t.Fatalf("rollback calls = %d, want disable, start, delete, and restore", rollbackCalls)
+	if rollbackCalls != 3 {
+		t.Fatalf("rollback calls = %d, want disable, start, and atomic rules restore", rollbackCalls)
 	}
 	if cleanupSawCanceledContext {
 		t.Fatal("firewall rollback inherited the canceled operation context")
+	}
+}
+
+func TestFirewallRollbackGivesEveryCleanupActionAFreshDeadline(t *testing.T) {
+	t.Parallel()
+
+	liveFollowupContexts := 0
+	backend := SystemBackend{
+		rollbackTimeout: time.Millisecond,
+		Runner: execx.RunnerFunc(func(ctx context.Context, spec execx.Spec) (execx.Output, error) {
+			if spec.Program == "systemctl" &&
+				containsArgument(spec.Arguments, "daemon-reload") {
+				<-ctx.Done()
+				return execx.Output{}, ctx.Err()
+			}
+			if ctx.Err() != nil {
+				return execx.Output{}, errors.New("cleanup action inherited an expired deadline")
+			}
+			liveFollowupContexts++
+			return execx.Output{}, nil
+		}),
+	}
+	err := backend.rollbackFirewall(
+		context.Background(),
+		nil,
+		true,
+		firewallState{},
+	)
+	if err == nil {
+		t.Fatal("timed out cleanup action was ignored")
+	}
+	if liveFollowupContexts != 3 {
+		t.Fatalf("live follow-up cleanup contexts = %d, want 3", liveFollowupContexts)
+	}
+}
+
+func TestFirewallPreflightsEveryManagedFileBeforeMutation(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	config := DefaultConfig()
+	config.ManageFirewall = true
+	profile := Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemFirewall},
+	}
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			switch {
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-enabled"):
+				return execx.Output{ExitCode: 1}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-active"):
+				return execx.Output{ExitCode: 3}, nil
+			case spec.Program == "nft" && containsArgument(spec.Arguments, "list"):
+				return execx.Output{ExitCode: 1}, nil
+			default:
+				return execx.Output{}, nil
+			}
+		}),
+	}
+	files := mustFirewallFiles(t, backend, profile)
+	rulesPath := backend.path(files[0].Path)
+	if err := os.MkdirAll(filepath.Dir(rulesPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldRules := []byte("old rules\n")
+	if err := os.WriteFile(rulesPath, oldRules, files[0].Mode); err != nil {
+		t.Fatal(err)
+	}
+	unitPath := backend.path(files[1].Path)
+	if err := os.MkdirAll(unitPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Apply(context.Background(), ItemFirewall, profile); err == nil {
+		t.Fatal("unsafe unit path was accepted")
+	}
+	got, err := os.ReadFile(rulesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, oldRules) {
+		t.Fatalf("rules were mutated before complete preflight: %q", got)
+	}
+}
+
+func TestFirewallRestoresExistingTableInOneAtomicBatch(t *testing.T) {
+	t.Parallel()
+
+	var calls []execx.Spec
+	backend := SystemBackend{
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			calls = append(calls, spec)
+			return execx.Output{}, nil
+		}),
+	}
+	previous := firewallState{
+		rulesActive: true,
+		activeRules: []byte("table inet ohtools_server_setup { chain input { policy drop; } }\n"),
+	}
+	if err := backend.restoreFirewallActiveState(context.Background(), previous); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || !reflect.DeepEqual(calls[0].Arguments, []string{"-f", "-"}) {
+		t.Fatalf("restore calls = %#v", calls)
+	}
+	if !bytes.Contains(calls[0].Stdin, []byte("delete table inet ohtools_server_setup\n")) ||
+		!bytes.Contains(calls[0].Stdin, previous.activeRules) {
+		t.Fatalf("atomic restore batch = %q", calls[0].Stdin)
+	}
+}
+
+func TestForeignInputBaseChainBlocksSSHAndFirewallActivation(t *testing.T) {
+	t.Parallel()
+
+	foreign := []byte(`{"nftables":[{"chain":{"family":"inet","table":"foreign","name":"input","type":"filter","hook":"input","prio":0,"policy":"drop"}}]}`)
+	if err := rejectForeignInputBaseChains(foreign); err == nil {
+		t.Fatal("foreign input base chain was accepted")
+	}
+	own := []byte(`{"nftables":[{"chain":{"family":"inet","table":"ohtools_server_setup","name":"input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}`)
+	if err := rejectForeignInputBaseChains(own); err != nil {
+		t.Fatalf("managed input chain was rejected: %v", err)
 	}
 }
 

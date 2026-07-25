@@ -30,9 +30,10 @@ import (
 )
 
 type SystemBackend struct {
-	Root       string
-	Runner     execx.Runner
-	HTTPClient HTTPDoer
+	Root            string
+	Runner          execx.Runner
+	HTTPClient      HTTPDoer
+	rollbackTimeout time.Duration
 }
 
 type HTTPDoer interface {
@@ -204,6 +205,27 @@ func (backend SystemBackend) Apply(
 		if persistent && effective {
 			return nil
 		}
+		service := managedServiceForItem(item)
+		var serviceChange serviceMutation
+		if service != "" {
+			serviceChange, err = backend.ensureManagedService(
+				ctx,
+				service,
+				managedServiceRequiresEnable(item),
+			)
+			if err != nil {
+				return err
+			}
+		}
+		withServiceRollback := func(cause error) error {
+			if cause == nil || service == "" {
+				return cause
+			}
+			return errors.Join(
+				cause,
+				backend.restoreManagedService(ctx, service, serviceChange),
+			)
+		}
 		verify := func() error {
 			if item == ItemCronPermissions {
 				if err := backend.repairCronPermissions(); err != nil {
@@ -227,7 +249,9 @@ func (backend SystemBackend) Apply(
 			return nil
 		}
 		if !persistent {
-			return backend.activateManagedFileWithPostVerify(ctx, *managed, verify)
+			return withServiceRollback(
+				backend.activateManagedFileWithPostVerify(ctx, *managed, verify),
+			)
 		}
 		if item == ItemCronPermissions {
 			return verify()
@@ -239,9 +263,9 @@ func (backend SystemBackend) Apply(
 			ctx,
 			expandManagedSpec(*managed.Activation, "", backend.path(managed.Path)),
 		); err != nil {
-			return err
+			return withServiceRollback(err)
 		}
-		return verify()
+		return withServiceRollback(verify())
 	}
 }
 
@@ -250,27 +274,24 @@ func (backend SystemBackend) effectiveStateConverged(
 	item Item,
 	_ Profile,
 ) (bool, error) {
+	if service := managedServiceForItem(item); service != "" {
+		state, err := backend.captureManagedService(ctx, service)
+		if err != nil {
+			return false, err
+		}
+		if !state.active ||
+			managedServiceRequiresEnable(item) && !state.enabled {
+			return false, nil
+		}
+	}
 	switch item {
 	case ItemCronPermissions:
 		return backend.cronPermissionsConverged()
 	case ItemFail2Ban:
-		active, err := backend.commandConverged(ctx, execx.Spec{
-			Program: "systemctl", Arguments: []string{"is-active", "--", "fail2ban.service"},
-		})
-		if err != nil || !active {
-			return active, err
-		}
 		return backend.commandConverged(ctx, execx.Spec{
 			Program: "fail2ban-client", Arguments: []string{"status", "sshd"},
 		})
 	case ItemTimeSync:
-		active, err := backend.commandConverged(ctx, execx.Spec{
-			Program:   "systemctl",
-			Arguments: []string{"is-active", "--", "systemd-timesyncd.service"},
-		})
-		if err != nil || !active {
-			return active, err
-		}
 		output, err := backend.runRaw(ctx, execx.Spec{
 			Program:   "timedatectl",
 			Arguments: []string{"show", "--property=NTPSynchronized", "--value"},
@@ -278,17 +299,8 @@ func (backend SystemBackend) effectiveStateConverged(
 		return err == nil && output.ExitCode == 0 &&
 			strings.EqualFold(strings.TrimSpace(string(output.Stdout)), "yes"), err
 	case ItemLogging:
-		return backend.commandConverged(ctx, execx.Spec{
-			Program:   "systemctl",
-			Arguments: []string{"is-active", "--", "systemd-journald.service"},
-		})
+		return true, nil
 	case ItemAuditd:
-		active, err := backend.commandConverged(ctx, execx.Spec{
-			Program: "systemctl", Arguments: []string{"is-active", "--", "auditd.service"},
-		})
-		if err != nil || !active {
-			return active, err
-		}
 		return backend.commandConverged(ctx, execx.Spec{
 			Program: "augenrules", Arguments: []string{"--check"},
 		})
@@ -312,13 +324,6 @@ func (backend SystemBackend) effectiveStateConverged(
 				[]string{"2", "1", "1", "1"},
 			), nil
 	case ItemZabbix:
-		active, err := backend.commandConverged(ctx, execx.Spec{
-			Program:   "systemctl",
-			Arguments: []string{"is-active", "--", "zabbix-agent2.service"},
-		})
-		if err != nil || !active {
-			return active, err
-		}
 		output, err := backend.runRaw(ctx, execx.Spec{
 			Program: "zabbix_agent2", Arguments: []string{"-t", "agent.ping"},
 		})
@@ -425,10 +430,138 @@ type firewallState struct {
 	activeRules []byte
 }
 
+type serviceState struct {
+	enabled bool
+	active  bool
+}
+
+type serviceMutation struct {
+	previous       serviceState
+	changedEnabled bool
+	changedActive  bool
+}
+
+func managedServiceForItem(item Item) string {
+	switch item {
+	case ItemFail2Ban:
+		return "fail2ban.service"
+	case ItemTimeSync:
+		return "systemd-timesyncd.service"
+	case ItemLogging:
+		return "systemd-journald.service"
+	case ItemAuditd:
+		return "auditd.service"
+	case ItemZabbix:
+		return "zabbix-agent2.service"
+	default:
+		return ""
+	}
+}
+
+func managedServiceRequiresEnable(item Item) bool {
+	return item != ItemLogging
+}
+
+func (backend SystemBackend) ensureManagedService(
+	ctx context.Context,
+	name string,
+	requireEnabled bool,
+) (serviceMutation, error) {
+	previous, err := backend.captureManagedService(ctx, name)
+	if err != nil {
+		return serviceMutation{}, err
+	}
+	change := serviceMutation{previous: previous}
+	if requireEnabled && !previous.enabled {
+		if _, err := backend.run(ctx, execx.Spec{
+			Program: "systemctl", Arguments: []string{"enable", "--", name},
+		}); err != nil {
+			return change, errors.Join(
+				err,
+				backend.restoreManagedService(ctx, name, change),
+			)
+		}
+		change.changedEnabled = true
+	}
+	if !previous.active {
+		if _, err := backend.run(ctx, execx.Spec{
+			Program: "systemctl", Arguments: []string{"start", "--", name},
+		}); err != nil {
+			return change, errors.Join(
+				err,
+				backend.restoreManagedService(ctx, name, change),
+			)
+		}
+		change.changedActive = true
+	}
+	return change, nil
+}
+
+func (backend SystemBackend) captureManagedService(
+	ctx context.Context,
+	name string,
+) (serviceState, error) {
+	state := serviceState{}
+	enabled, err := backend.runRaw(ctx, execx.Spec{
+		Program: "systemctl", Arguments: []string{"is-enabled", "--", name},
+	})
+	if err != nil {
+		return state, err
+	}
+	if enabled.ExitCode != 0 && enabled.ExitCode != 1 {
+		return state, fmt.Errorf("inspect %s enablement: exit %d", name, enabled.ExitCode)
+	}
+	state.enabled = enabled.ExitCode == 0
+	active, err := backend.runRaw(ctx, execx.Spec{
+		Program: "systemctl", Arguments: []string{"is-active", "--", name},
+	})
+	if err != nil {
+		return state, err
+	}
+	if active.ExitCode != 0 && active.ExitCode != 3 {
+		return state, fmt.Errorf("inspect %s state: exit %d", name, active.ExitCode)
+	}
+	state.active = active.ExitCode == 0
+	return state, nil
+}
+
+func (backend SystemBackend) restoreManagedService(
+	ctx context.Context,
+	name string,
+	change serviceMutation,
+) error {
+	var activeErr error
+	if change.changedActive {
+		activeAction := "stop"
+		if change.previous.active {
+			activeAction = "start"
+		}
+		_, activeErr = backend.runCleanup(ctx, execx.Spec{
+			Program: "systemctl", Arguments: []string{activeAction, "--", name},
+		})
+	}
+	var enableErr error
+	if change.changedEnabled {
+		enableAction := "disable"
+		if change.previous.enabled {
+			enableAction = "enable"
+		}
+		_, enableErr = backend.runCleanup(ctx, execx.Spec{
+			Program: "systemctl", Arguments: []string{enableAction, "--", name},
+		})
+	}
+	return errors.Join(activeErr, enableErr)
+}
+
 func (backend SystemBackend) applySSH(
 	ctx context.Context,
 	profile Profile,
 ) error {
+	if profile.Config.ManageFirewall {
+		if err := backend.ensureNoForeignInputBaseChain(ctx); err != nil {
+			return err
+		}
+	}
 	if err := backend.ensureSSHAdministratorAccess(ctx, profile); err != nil {
 		return err
 	}
@@ -481,12 +614,7 @@ func (backend SystemBackend) rollbackSSH(
 	if restoreErr != nil || !reactivate {
 		return restoreErr
 	}
-	cleanupContext, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx),
-		rollbackCommandTimeout,
-	)
-	defer cancel()
-	_, reloadErr := backend.run(cleanupContext, execx.Spec{
+	_, reloadErr := backend.runCleanup(ctx, execx.Spec{
 		Program: "systemctl", Arguments: []string{"reload", "ssh.service"},
 	})
 	return reloadErr
@@ -632,6 +760,9 @@ func (backend SystemBackend) applyFirewall(
 	ctx context.Context,
 	profile Profile,
 ) error {
+	if err := backend.ensureNoForeignInputBaseChain(ctx); err != nil {
+		return err
+	}
 	previousState, err := backend.captureFirewallState(ctx)
 	if err != nil {
 		return err
@@ -640,6 +771,12 @@ func (backend SystemBackend) applyFirewall(
 	if err != nil {
 		return err
 	}
+	type candidate struct {
+		managed   managedFile
+		snapshot  fileSnapshot
+		converged bool
+	}
+	candidates := make([]candidate, 0, len(files))
 	snapshots := make([]fileSnapshot, 0, len(files))
 	unitChanged := false
 	for _, managed := range files {
@@ -647,19 +784,34 @@ func (backend SystemBackend) applyFirewall(
 		if err != nil {
 			return err
 		}
-		snapshots = append(snapshots, snapshot)
 		converged, err := backend.fileConverged(managed)
 		if err != nil {
 			return err
 		}
-		if converged {
-			continue
+		if !converged && managed.Validate != nil {
+			if _, err := backend.run(ctx, execx.Spec{
+				Program:   managed.Validate.Program,
+				Arguments: []string{"-c", "-f", "-"},
+				Stdin:     append([]byte(nil), managed.Content...),
+			}); err != nil {
+				return fmt.Errorf("validate %s: %w", managed.Path, err)
+			}
 		}
-		if managed.Path == "/etc/systemd/system/ohtools-server-setup-firewall.service" {
+		if !converged &&
+			managed.Path == "/etc/systemd/system/ohtools-server-setup-firewall.service" {
 			unitChanged = true
 		}
-		managed.Activation = nil
-		if err := backend.activateManagedFile(ctx, managed); err != nil {
+		candidates = append(candidates, candidate{
+			managed: managed, snapshot: snapshot, converged: converged,
+		})
+		snapshots = append(snapshots, snapshot)
+	}
+	for _, candidate := range candidates {
+		if candidate.converged {
+			continue
+		}
+		candidate.managed.Activation = nil
+		if err := backend.activateManagedFile(ctx, candidate.managed); err != nil {
 			return errors.Join(
 				err,
 				backend.rollbackFirewall(ctx, snapshots, unitChanged, previousState),
@@ -717,15 +869,10 @@ func (backend SystemBackend) rollbackFirewall(
 	unitChanged bool,
 	previous firewallState,
 ) error {
-	cleanupContext, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx),
-		rollbackCommandTimeout,
-	)
-	defer cancel()
 	restoreErr := restoreFileSnapshots(snapshots)
 	var reloadErr error
 	if unitChanged {
-		_, reloadErr = backend.run(cleanupContext, execx.Spec{
+		_, reloadErr = backend.runCleanup(ctx, execx.Spec{
 			Program: "systemctl", Arguments: []string{"daemon-reload"},
 		})
 	}
@@ -733,7 +880,7 @@ func (backend SystemBackend) rollbackFirewall(
 	if previous.enabled {
 		action = "enable"
 	}
-	_, enablementErr := backend.run(cleanupContext, execx.Spec{
+	_, enablementErr := backend.runCleanup(ctx, execx.Spec{
 		Program: "systemctl",
 		Arguments: []string{
 			action, "--", "ohtools-server-setup-firewall.service",
@@ -743,13 +890,13 @@ func (backend SystemBackend) rollbackFirewall(
 	if previous.unitActive {
 		activeAction = "start"
 	}
-	_, unitActiveErr := backend.run(cleanupContext, execx.Spec{
+	_, unitActiveErr := backend.runCleanup(ctx, execx.Spec{
 		Program: "systemctl",
 		Arguments: []string{
 			activeAction, "--", "ohtools-server-setup-firewall.service",
 		},
 	})
-	rulesErr := backend.restoreFirewallActiveState(cleanupContext, previous)
+	rulesErr := backend.restoreFirewallActiveState(ctx, previous)
 	return errors.Join(
 		restoreErr,
 		reloadErr,
@@ -811,7 +958,19 @@ func (backend SystemBackend) restoreFirewallActiveState(
 	ctx context.Context,
 	previous firewallState,
 ) error {
-	deleted, err := backend.runRaw(ctx, execx.Spec{
+	if previous.rulesActive {
+		batch := append(
+			[]byte("delete table inet ohtools_server_setup\n"),
+			previous.activeRules...,
+		)
+		_, err := backend.runCleanup(ctx, execx.Spec{
+			Program:   "nft",
+			Arguments: []string{"-f", "-"},
+			Stdin:     batch,
+		})
+		return err
+	}
+	deleted, err := backend.runRawCleanup(ctx, execx.Spec{
 		Program: "nft",
 		Arguments: []string{
 			"delete", "table", "inet", "ohtools_server_setup",
@@ -823,15 +982,49 @@ func (backend SystemBackend) restoreFirewallActiveState(
 	if deleted.ExitCode != 0 && deleted.ExitCode != 1 {
 		return fmt.Errorf("remove failed active firewall state: exit %d", deleted.ExitCode)
 	}
-	if !previous.rulesActive {
+	return nil
+}
+
+func (backend SystemBackend) ensureNoForeignInputBaseChain(ctx context.Context) error {
+	if backend.Root != "" {
 		return nil
 	}
-	_, err = backend.run(ctx, execx.Spec{
-		Program:   "nft",
-		Arguments: []string{"-f", "-"},
-		Stdin:     previous.activeRules,
+	output, err := backend.run(ctx, execx.Spec{
+		Program: "nft", Arguments: []string{"--json", "list", "ruleset"},
 	})
-	return err
+	if err != nil {
+		return fmt.Errorf("inspect nftables input chains: %w", err)
+	}
+	return rejectForeignInputBaseChains(output.Stdout)
+}
+
+func rejectForeignInputBaseChains(input []byte) error {
+	var ruleset struct {
+		NFTables []struct {
+			Chain *struct {
+				Table string `json:"table"`
+				Name  string `json:"name"`
+				Hook  string `json:"hook"`
+			} `json:"chain"`
+		} `json:"nftables"`
+	}
+	if err := json.Unmarshal(input, &ruleset); err != nil {
+		return fmt.Errorf("decode nftables ruleset: %w", err)
+	}
+	if ruleset.NFTables == nil {
+		return errors.New("nftables ruleset is missing nftables array")
+	}
+	for _, object := range ruleset.NFTables {
+		if object.Chain != nil && object.Chain.Hook == "input" &&
+			object.Chain.Table != "ohtools_server_setup" {
+			return fmt.Errorf(
+				"foreign nftables input base chain %s/%s can block the managed SSH port",
+				object.Chain.Table,
+				object.Chain.Name,
+			)
+		}
+	}
+	return nil
 }
 
 func (backend SystemBackend) firewallFiles(profile Profile) ([]managedFile, error) {
@@ -909,8 +1102,12 @@ func (backend SystemBackend) observeSSH(
 
 func (backend SystemBackend) sshIncludePresent() (bool, error) {
 	target := backend.path("/etc/ssh/sshd_config")
-	if err := ensureNoSSHIncludeArtifacts(target); err != nil {
+	recoverable, err := backend.sshIncludeRecoveryPending(target)
+	if err != nil {
 		return false, err
+	}
+	if recoverable {
+		return false, nil
 	}
 	info, err := os.Lstat(target)
 	if errors.Is(err, os.ErrNotExist) {
@@ -941,22 +1138,35 @@ func (backend SystemBackend) sshIncludePresent() (bool, error) {
 	return false, nil
 }
 
-func ensureNoSSHIncludeArtifacts(target string) error {
-	for _, suffix := range []string{
-		".ohtools-include.stage",
-		".ohtools-include.rollback",
-	} {
-		artifact := target + suffix
-		if _, err := os.Lstat(artifact); err == nil {
-			return fmt.Errorf(
-				"stale SSH include transaction artifact %s requires recovery",
-				artifact,
-			)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
+func (backend SystemBackend) sshIncludeRecoveryPending(target string) (bool, error) {
+	stageExists, err := backend.trustedRecoveryArtifactExists(
+		target + ".ohtools-include.stage",
+	)
+	if err != nil {
+		return false, err
 	}
-	return nil
+	backupExists, err := backend.trustedRecoveryArtifactExists(
+		target + ".ohtools-include.rollback",
+	)
+	if err != nil {
+		return false, err
+	}
+	if !stageExists && !backupExists {
+		return false, nil
+	}
+	targetExists, err := backend.trustedRecoveryArtifactExists(target)
+	if err != nil {
+		return false, err
+	}
+	if stageExists && !targetExists && !backupExists {
+		return false, errors.New(
+			"SSH include transaction lost both original and rollback files",
+		)
+	}
+	if stageExists && targetExists && backupExists {
+		return false, errors.New("SSH include transaction has impossible artifacts")
+	}
+	return true, nil
 }
 
 func (backend SystemBackend) beginSSHInclude(
@@ -1218,18 +1428,38 @@ func (backend SystemBackend) applyPackages(ctx context.Context, profile Profile)
 			}
 		}
 	}
+	observation, err := backend.observePackages(ctx, profile)
+	if err != nil {
+		return err
+	}
+	missing, ok := observation.Details["missing"].([]string)
+	if !ok {
+		return errors.New("package observation did not return an exact missing set")
+	}
+	if len(missing) == 0 {
+		return nil
+	}
 	environment := map[string]string{"DEBIAN_FRONTEND": "noninteractive"}
 	if _, err := backend.run(ctx, execx.Spec{
 		Program: "apt-get", Arguments: []string{"update"}, Environment: environment,
 	}); err != nil {
 		return err
 	}
-	arguments := []string{"install", "-y", "--no-install-recommends", "--"}
-	arguments = append(arguments, packages...)
-	_, err := backend.run(ctx, execx.Spec{
+	arguments := []string{"install", "-y", "--no-install-recommends", "--no-upgrade", "--"}
+	arguments = append(arguments, missing...)
+	if _, err := backend.run(ctx, execx.Spec{
 		Program: "apt-get", Arguments: arguments, Environment: environment,
-	})
-	return err
+	}); err != nil {
+		return err
+	}
+	verified, err := backend.observePackages(ctx, profile)
+	if err != nil {
+		return err
+	}
+	if !verified.Converged {
+		return errors.New("required packages did not converge after installation")
+	}
+	return nil
 }
 
 func (backend SystemBackend) packageInstalled(
@@ -2028,8 +2258,12 @@ func (backend SystemBackend) desiredFile(item Item, profile Profile) (*managedFi
 
 func (backend SystemBackend) fileConverged(managed managedFile) (bool, error) {
 	target := backend.path(managed.Path)
-	if err := ensureNoManagedTransactionArtifacts(target); err != nil {
+	recoverable, err := backend.managedRecoveryPending(target)
+	if err != nil {
 		return false, err
+	}
+	if recoverable {
+		return false, nil
 	}
 	return backend.managedFileContentConverged(managed)
 }
@@ -2244,6 +2478,99 @@ func ensureNoManagedTransactionArtifacts(target string) error {
 	return nil
 }
 
+func (backend SystemBackend) managedRecoveryPending(target string) (bool, error) {
+	journalTempExists, err := backend.trustedRecoveryArtifactExists(
+		target + ".transaction-v1.json.stage",
+	)
+	if err != nil {
+		return false, err
+	}
+	journalPath := target + ".transaction-v1.json"
+	journalExists, err := backend.trustedRecoveryArtifactExists(journalPath)
+	if err != nil {
+		return false, err
+	}
+	stageExists, err := backend.trustedRecoveryArtifactExists(target + ".stage")
+	if err != nil {
+		return false, err
+	}
+	backupExists, err := backend.trustedRecoveryArtifactExists(target + ".rollback")
+	if err != nil {
+		return false, err
+	}
+	if !journalExists {
+		return journalTempExists || stageExists || backupExists, nil
+	}
+	journal, err := backend.readManagedTransactionJournal(journalPath)
+	if err != nil {
+		return false, err
+	}
+	targetExists, err := backend.trustedRecoveryArtifactExists(target)
+	if err != nil {
+		return false, err
+	}
+	if err := validateManagedRecoveryState(
+		journal,
+		targetExists,
+		stageExists,
+		backupExists,
+	); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func validateManagedRecoveryState(
+	journal managedTransactionJournal,
+	targetExists bool,
+	stageExists bool,
+	backupExists bool,
+) error {
+	switch journal.Phase {
+	case "staged":
+		if journal.HadTarget {
+			beforeBackup := targetExists && stageExists && !backupExists
+			afterBackup := !targetExists && stageExists && backupExists
+			if !beforeBackup && !afterBackup {
+				return errors.New("managed staged transaction state is incomplete")
+			}
+			return nil
+		}
+		beforeActivation := !targetExists && stageExists && !backupExists
+		afterActivation := targetExists && !stageExists && !backupExists
+		if !beforeActivation && !afterActivation {
+			return errors.New("managed staged transaction state is incomplete")
+		}
+	case "backed_up":
+		beforeActivation := !targetExists && stageExists && backupExists
+		afterActivation := targetExists && !stageExists && backupExists
+		if !journal.HadTarget || !beforeActivation && !afterActivation {
+			return errors.New("managed transaction rollback file is missing")
+		}
+	case "activated":
+		if !targetExists || stageExists ||
+			journal.HadTarget && !backupExists ||
+			!journal.HadTarget && backupExists {
+			return errors.New("managed activated transaction state is incomplete")
+		}
+	case "verified":
+		if !targetExists || stageExists ||
+			!journal.HadTarget && backupExists {
+			return errors.New("verified managed transaction target is missing")
+		}
+	case "rolling_back":
+		if stageExists || !journal.HadTarget && backupExists {
+			return errors.New("managed rollback has an unexpected backup file")
+		}
+		if journal.HadTarget && !backupExists && !targetExists {
+			return errors.New("managed rollback original target is missing")
+		}
+	default:
+		return errors.New("invalid managed transaction journal phase")
+	}
+	return nil
+}
+
 func (backend SystemBackend) rollbackManaged(
 	ctx context.Context,
 	target string,
@@ -2279,13 +2606,8 @@ func (backend SystemBackend) rollbackManaged(
 	var activationErr error
 	if removeErr == nil && removeSyncErr == nil &&
 		restoreErr == nil && syncErr == nil && activation != nil {
-		cleanupContext, cancel := context.WithTimeout(
-			context.WithoutCancel(ctx),
-			rollbackCommandTimeout,
-		)
 		spec := expandManagedSpec(*activation, "", target)
-		_, activationErr = backend.run(cleanupContext, spec)
-		cancel()
+		_, activationErr = backend.runCleanup(ctx, spec)
 	}
 	var removeJournalErr error
 	if removeErr == nil && removeSyncErr == nil &&
@@ -2349,24 +2671,9 @@ func (backend SystemBackend) recoverManagedTransaction(target string) error {
 	); err != nil {
 		return err
 	}
-	content, err := os.ReadFile(journalPath) // #nosec G304 -- derived trusted path.
+	journal, err := backend.readManagedTransactionJournal(journalPath)
 	if err != nil {
 		return err
-	}
-	var journal managedTransactionJournal
-	if err := strictjson.Decode(content, &journal); err != nil {
-		return fmt.Errorf("decode managed transaction journal: %w", err)
-	}
-	if journal.SchemaVersion != "1" {
-		return errors.New("unsupported managed transaction journal schema")
-	}
-	switch journal.Phase {
-	case "staged", "backed_up", "activated", "verified", "rolling_back":
-	default:
-		return errors.New("invalid managed transaction journal phase")
-	}
-	if journal.Phase == "backed_up" && !journal.HadTarget {
-		return errors.New("managed transaction journal has an impossible state")
 	}
 	if journal.Phase == "verified" {
 		targetExists, err := backend.trustedRecoveryArtifactExists(target)
@@ -2388,6 +2695,40 @@ func (backend SystemBackend) recoverManagedTransaction(target string) error {
 		return err
 	}
 	return removeManagedTransactionJournal(target)
+}
+
+func (backend SystemBackend) readManagedTransactionJournal(
+	journalPath string,
+) (managedTransactionJournal, error) {
+	content, err := os.ReadFile(journalPath) // #nosec G304 -- derived trusted path.
+	if err != nil {
+		return managedTransactionJournal{}, err
+	}
+	var journal managedTransactionJournal
+	if err := strictjson.Decode(content, &journal); err != nil {
+		return managedTransactionJournal{}, fmt.Errorf(
+			"decode managed transaction journal: %w",
+			err,
+		)
+	}
+	if journal.SchemaVersion != "1" {
+		return managedTransactionJournal{}, errors.New(
+			"unsupported managed transaction journal schema",
+		)
+	}
+	switch journal.Phase {
+	case "staged", "backed_up", "activated", "verified", "rolling_back":
+	default:
+		return managedTransactionJournal{}, errors.New(
+			"invalid managed transaction journal phase",
+		)
+	}
+	if journal.Phase == "backed_up" && !journal.HadTarget {
+		return managedTransactionJournal{}, errors.New(
+			"managed transaction journal has an impossible state",
+		)
+	}
+	return journal, nil
 }
 
 func (backend SystemBackend) rollbackInterruptedManagedTransaction(
@@ -2775,6 +3116,37 @@ func (backend SystemBackend) runRaw(ctx context.Context, spec execx.Spec) (execx
 		return output, fmt.Errorf("%s output exceeded its limit", spec.Program)
 	}
 	return output, nil
+}
+
+func (backend SystemBackend) runCleanup(
+	ctx context.Context,
+	spec execx.Spec,
+) (execx.Output, error) {
+	cleanupContext, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		backend.cleanupTimeout(),
+	)
+	defer cancel()
+	return backend.run(cleanupContext, spec)
+}
+
+func (backend SystemBackend) runRawCleanup(
+	ctx context.Context,
+	spec execx.Spec,
+) (execx.Output, error) {
+	cleanupContext, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		backend.cleanupTimeout(),
+	)
+	defer cancel()
+	return backend.runRaw(cleanupContext, spec)
+}
+
+func (backend SystemBackend) cleanupTimeout() time.Duration {
+	if backend.rollbackTimeout > 0 {
+		return backend.rollbackTimeout
+	}
+	return rollbackCommandTimeout
 }
 
 func (backend SystemBackend) path(absolute string) string {

@@ -51,10 +51,16 @@ func TestSystemBackendPlansAndAppliesOrdinaryUpgradeWithIsolatedIndexes(t *testi
 	if err := backend.ApplyUpgrade(context.Background(), profile, upgrades); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 5 {
+	if len(calls) != 4 {
 		t.Fatalf("calls = %#v", calls)
 	}
-	for _, call := range calls {
+	if calls[0].Program != "apt-get" ||
+		!containsArgument(calls[0].Arguments, "--simulate") ||
+		containsArgument(calls[0].Arguments, "update") ||
+		hasIsolatedListsOption(calls[0].Arguments) {
+		t.Fatalf("planner performed a mutating APT operation: %#v", calls[0])
+	}
+	for _, call := range calls[1:] {
 		if call.Program != "apt-get" {
 			t.Fatalf("program = %q", call.Program)
 		}
@@ -62,7 +68,7 @@ func TestSystemBackendPlansAndAppliesOrdinaryUpgradeWithIsolatedIndexes(t *testi
 			t.Fatalf("apt call does not use isolated lists: %#v", call.Arguments)
 		}
 	}
-	install := calls[4].Arguments
+	install := calls[3].Arguments
 	if !containsArgument(install, "install") ||
 		!containsArgument(install, "--only-upgrade") ||
 		!containsArgument(install, "--no-remove") ||
@@ -71,6 +77,36 @@ func TestSystemBackendPlansAndAppliesOrdinaryUpgradeWithIsolatedIndexes(t *testi
 	}
 	if _, err := os.Stat(filepath.Join(root, "var", "cache", "ohtools", "server-setup", "apt")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("planner left persistent APT state: %v", err)
+	}
+}
+
+func TestSystemBackendUpgradePlanIsReadOnly(t *testing.T) {
+	t.Parallel()
+
+	root := filepath.Join(t.TempDir(), "must-not-be-created")
+	var calls []execx.Spec
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			calls = append(calls, spec)
+			return execx.Output{
+				Stdout: []byte("Inst curl [7.88.1] (7.88.2 Debian:12/stable [amd64])\n"),
+			}, nil
+		}),
+	}
+	_, err := backend.PlanUpgrade(context.Background(), Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   DefaultConfig(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || containsArgument(calls[0].Arguments, "update") ||
+		hasIsolatedListsOption(calls[0].Arguments) {
+		t.Fatalf("upgrade plan was not read-only: %#v", calls)
+	}
+	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("upgrade plan wrote filesystem state: %v", err)
 	}
 }
 
