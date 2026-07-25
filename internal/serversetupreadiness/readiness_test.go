@@ -48,11 +48,46 @@ func TestSevenImageWorkflowExecutesRealBinaryApplyTwice(t *testing.T) {
 		"binary-smoke /work/server-setup-base_linux_amd64",
 		"--tmpfs /etc/ohtools:",
 		"--tmpfs /etc/profile.d:",
-		"server-setup-entitlement-fixture_linux_amd64:/usr/bin/pro:ro",
+		"server-setup-entitlement-fixture-root_linux_amd64:/usr/bin/pro:ro",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("seven-image workflow is missing %q", required)
 		}
+	}
+}
+
+func TestReadinessWorkflowsInstallRootOwnedEntitlementFixture(t *testing.T) {
+	t.Parallel()
+
+	for _, workflowName := range []string{"ci.yml", "release.yml"} {
+		workflowName := workflowName
+		t.Run(workflowName, func(t *testing.T) {
+			t.Parallel()
+
+			content, err := os.ReadFile("../../.github/workflows/" + workflowName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			workflow := string(content)
+			required := []string{
+				"sudo install -o root -g root -m 0755",
+				"server-setup-entitlement-fixture-root_linux_amd64",
+				"server-setup-entitlement-fixture-root_linux_amd64:/usr/bin/pro:ro",
+			}
+			for _, value := range required {
+				if !strings.Contains(workflow, value) {
+					t.Errorf("%s does not prepare the trusted entitlement fixture with %q", workflowName, value)
+				}
+			}
+			for _, forbidden := range []string{
+				"sudo chown root:root server-setup-entitlement-fixture_linux_amd64",
+				"chmod 0755 server-setup-entitlement-fixture_linux_amd64",
+			} {
+				if strings.Contains(workflow, forbidden) {
+					t.Errorf("%s retains unsafe post-chown permission mutation %q", workflowName, forbidden)
+				}
+			}
+		})
 	}
 }
 

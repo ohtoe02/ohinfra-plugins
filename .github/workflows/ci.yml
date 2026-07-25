@@ -112,8 +112,9 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
             -o server-setup-entitlement-fixture_linux_amd64 \
             ./tools/server-setup-entitlement-fixture
-          sudo chown root:root server-setup-entitlement-fixture_linux_amd64
-          chmod 0755 server-setup-entitlement-fixture_linux_amd64
+          sudo install -o root -g root -m 0755 \
+            server-setup-entitlement-fixture_linux_amd64 \
+            server-setup-entitlement-fixture-root_linux_amd64
       - name: Run plugin inside declared OS image
         shell: bash
         env:
@@ -139,7 +140,7 @@ jobs:
             --tmpfs /etc/profile.d:rw,nosuid,nodev,size=1m,mode=0755 \
             --tmpfs /etc/apt/sources.list.d:rw,nosuid,nodev,size=1m,mode=0755 \
             --volume "$PWD:/work:ro" \
-            --volume "$PWD/server-setup-entitlement-fixture_linux_amd64:/usr/bin/pro:ro" \
+            --volume "$PWD/server-setup-entitlement-fixture-root_linux_amd64:/usr/bin/pro:ro" \
             "$IMAGE" sh -ceu '
               . /etc/os-release
               mkdir -p /etc/ohtools/plugins
