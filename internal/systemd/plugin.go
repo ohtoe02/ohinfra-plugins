@@ -8,15 +8,15 @@ import (
 	"slices"
 	"time"
 
-	pluginconfig "github.com/ohtoe02/ohinfra-plugins/internal/config"
-	"github.com/ohtoe02/ohinfra-plugins/internal/execx"
-	"github.com/ohtoe02/ohinfra-plugins/internal/protocol"
+	pluginconfig "github.com/ohtoe02/ohtools-plugins/internal/config"
+	"github.com/ohtoe02/ohtools-plugins/internal/execx"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
 )
 
 const (
 	Name        = "systemd-base"
-	Description = "Systemd service status, logs, and controlled restart operations for ohinfra."
-	ConfigPath  = "/etc/ohinfra/plugins/systemd-base.yaml"
+	Description = "Systemd service status, logs, and controlled restart operations for ohtools."
+	ConfigPath  = "/etc/ohtools/plugins/systemd-base.yaml"
 )
 
 type Config struct {

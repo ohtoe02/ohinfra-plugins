@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/ohtoe02/ohinfra-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
 )
 
 const Mask = "********"

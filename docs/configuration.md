@@ -3,7 +3,7 @@
 Each plugin uses compiled defaults followed by an optional strict system YAML:
 
 ```text
-/etc/ohinfra/plugins/<plugin-name>.yaml
+/etc/ohtools/plugins/<plugin-name>.yaml
 ```
 
 Host `--config`, environment variables, XDG user configuration, and per-user

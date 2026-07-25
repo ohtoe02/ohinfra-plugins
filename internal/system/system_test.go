@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ohtoe02/ohinfra-plugins/internal/execx"
-	"github.com/ohtoe02/ohinfra-plugins/internal/protocol"
-	"github.com/ohtoe02/ohinfra-plugins/internal/storage"
+	"github.com/ohtoe02/ohtools-plugins/internal/execx"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/storage"
 )
 
 func TestCollectParsesLinuxSystemFiles(t *testing.T) {

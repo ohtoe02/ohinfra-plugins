@@ -3,8 +3,8 @@ package main
 import (
 	"os"
 
-	dockerplugin "github.com/ohtoe02/ohinfra-plugins/internal/docker"
-	"github.com/ohtoe02/ohinfra-plugins/internal/protocol"
+	dockerplugin "github.com/ohtoe02/ohtools-plugins/internal/docker"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
 )
 
 var (

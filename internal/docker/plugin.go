@@ -17,16 +17,16 @@ import (
 	"strings"
 	"time"
 
-	pluginconfig "github.com/ohtoe02/ohinfra-plugins/internal/config"
-	"github.com/ohtoe02/ohinfra-plugins/internal/execx"
-	"github.com/ohtoe02/ohinfra-plugins/internal/protocol"
-	"github.com/ohtoe02/ohinfra-plugins/internal/redact"
+	pluginconfig "github.com/ohtoe02/ohtools-plugins/internal/config"
+	"github.com/ohtoe02/ohtools-plugins/internal/execx"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/redact"
 )
 
 const (
 	Name        = "docker-base"
-	Description = "Docker Engine and Compose diagnostics for ohinfra."
-	ConfigPath  = "/etc/ohinfra/plugins/docker-base.yaml"
+	Description = "Docker Engine and Compose diagnostics for ohtools."
+	ConfigPath  = "/etc/ohtools/plugins/docker-base.yaml"
 )
 
 var objectName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:@/+~-]{0,254}$`)

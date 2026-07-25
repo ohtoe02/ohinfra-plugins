@@ -3,8 +3,8 @@ package main
 import (
 	"os"
 
-	"github.com/ohtoe02/ohinfra-plugins/internal/protocol"
-	"github.com/ohtoe02/ohinfra-plugins/internal/system"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/system"
 )
 
 var (

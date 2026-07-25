@@ -12,7 +12,7 @@ internal/<domain>/         collectors, command handlers, and tests
 ```
 
 The repository intentionally exports no Go SDK. The stable interfaces are the
-ohinfra CLI, Result schema v1, strict YAML configuration, and executable plugin
+ohtools CLI, Result schema v1, strict YAML configuration, and executable plugin
 protocol v1.
 
 ## Adding a command

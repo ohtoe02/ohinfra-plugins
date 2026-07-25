@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ohtoe02/ohinfra-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
 )
 
 func main() {

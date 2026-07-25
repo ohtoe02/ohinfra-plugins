@@ -22,5 +22,5 @@ a root-owned regular file, must not be a symlink, and must not be group- or
 world-writable. Secret values belong in separate root-owned files and are
 referenced only by plugins that explicitly document such a setting.
 
-Only versions present as non-yanked entries in the signed ohinfra plugin
+Only versions present as non-yanked entries in the signed ohtools plugin
 catalog are supported.

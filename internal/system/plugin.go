@@ -7,15 +7,15 @@ import (
 	"slices"
 	"time"
 
-	pluginconfig "github.com/ohtoe02/ohinfra-plugins/internal/config"
-	"github.com/ohtoe02/ohinfra-plugins/internal/protocol"
-	"github.com/ohtoe02/ohinfra-plugins/internal/storage"
+	pluginconfig "github.com/ohtoe02/ohtools-plugins/internal/config"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/storage"
 )
 
 const (
 	Name        = "system-base"
-	Description = "Operating system information and health diagnostics for ohinfra."
-	ConfigPath  = "/etc/ohinfra/plugins/system-base.yaml"
+	Description = "Operating system information and health diagnostics for ohtools."
+	ConfigPath  = "/etc/ohtools/plugins/system-base.yaml"
 )
 
 type Config struct {

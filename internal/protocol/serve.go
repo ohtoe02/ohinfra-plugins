@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ohtoe02/ohinfra-plugins/internal/strictjson"
+	"github.com/ohtoe02/ohtools-plugins/internal/strictjson"
 )
 
 type Definition struct {

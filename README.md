@@ -1,12 +1,12 @@
-# ohinfra first-party plugins
+# ohtools first-party plugins
 
 This public monorepo contains the first-party executable plugins for
-[`ohinfra`](https://github.com/ohtoe02/ohinfra). Each plugin is an independent,
+[`ohtools`](https://github.com/ohtoe02/ohtools). Each plugin is an independent,
 statically linked Linux binary with its own version and release lifecycle.
 
 Plugin package names are visible in the catalog and management commands. They
 do not alter operator-facing CLI paths: `docker-base`, for example, provides
-`ohinfra docker ...` and `ohinfra compose ...`.
+`ohtools docker ...` and `ohtools compose ...`.
 
 ## Production plugins
 
@@ -52,5 +52,5 @@ A release contains the raw `<plugin>_linux_amd64` binary, its SHA-256 file, and
 an SPDX JSON SBOM.
 
 Catalog metadata and signing remain in the separate
-[`ohinfra-plugin-catalog`](https://github.com/ohtoe02/ohinfra-plugin-catalog)
+[`ohtools-plugin-catalog`](https://github.com/ohtoe02/ohtools-plugin-catalog)
 trust domain.

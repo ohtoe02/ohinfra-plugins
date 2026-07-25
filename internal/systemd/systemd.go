@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ohtoe02/ohinfra-plugins/internal/execx"
-	"github.com/ohtoe02/ohinfra-plugins/internal/protocol"
-	"github.com/ohtoe02/ohinfra-plugins/internal/redact"
+	"github.com/ohtoe02/ohtools-plugins/internal/execx"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/redact"
 )
 
 var unitName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,254}$`)

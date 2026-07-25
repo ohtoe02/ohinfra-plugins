@@ -12,7 +12,7 @@ Each plugin is versioned independently.
 4. Verify the raw `linux/amd64` binary, SHA-256 file, and SPDX JSON SBOM.
 5. Run the manifest in the catalog sandbox and submit the immutable URL, size,
    digest, manifest, minimum host version, publication time, and identical
-   optional description to `ohinfra-plugin-catalog`.
+   optional description to `ohtools-plugin-catalog`.
 6. Publish a signed catalog snapshot only after CI and maintainer approval.
 
 Do not replace an existing release asset or reuse a tag. Correct a release by
