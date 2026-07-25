@@ -93,7 +93,18 @@ When Zabbix is enabled, replace all repository package fields with the exact
 HTTPS URL, byte size, and lowercase SHA-256 of the immutable package from
 `repo.zabbix.com`. Key source files must be regular, root-owned files below
 `/etc/ohtools/plugins/keys`, must not be group/world-writable, and may contain
-public keys only.
+public keys only. Enabling SSH hardening requires at least one administrator
+with such a key source. A non-default SSH port additionally requires
+`manage_firewall: true`; the managed firewall is applied before sshd is
+reloaded.
+
+On releases whose vendor `sshd_config` lacks an early drop-in include, the
+plugin transactionally inserts
+`Include /etc/ssh/sshd_config.d/*.conf`, validates it, and rolls it back if
+effective-state validation or reload fails. Firewall persistence is provided
+by the dedicated `ohtools-server-setup-firewall.service`; it loads only the
+ohtools-owned nftables file and does not replace the distribution's main
+nftables configuration.
 
 The supported OS matrix is Debian 10–13 and Ubuntu 20.04, 22.04, and 24.04 LTS.
 Debian 10 requires an active Freexian ELTS source; Ubuntu 20.04 requires an

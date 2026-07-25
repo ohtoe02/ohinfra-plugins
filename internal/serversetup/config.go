@@ -109,6 +109,29 @@ func ValidateConfig(config Config) error {
 			return errors.New("zabbix.repository_package_sha256 must be lowercase SHA-256")
 		}
 	}
+	selected, err := ExpandItems(nil, config)
+	if err != nil {
+		return err
+	}
+	if slices.Contains(selected, ItemSSH) {
+		hasTrustedKeySource := false
+		for _, administrator := range config.Administrators {
+			if len(administrator.AuthorizedKeySources) > 0 {
+				hasTrustedKeySource = true
+				break
+			}
+		}
+		if !hasTrustedKeySource {
+			return errors.New(
+				"ssh hardening requires at least one administrator with an authorized key source",
+			)
+		}
+		if config.SSHPort != 22 && !config.ManageFirewall {
+			return errors.New(
+				"a non-default ssh_port requires manage_firewall so the new port is opened before reload",
+			)
+		}
+	}
 	return nil
 }
 

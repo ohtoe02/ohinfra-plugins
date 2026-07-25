@@ -30,12 +30,14 @@ type Backend interface {
 }
 
 type Manager struct {
-	Backend  Backend
-	Config   Config
-	Platform Platform
-	Host     string
-	Tool     protocol.Tool
-	Now      func() time.Time
+	Backend       Backend
+	Config        Config
+	Platform      Platform
+	ConfigPath    string
+	ConfigMissing bool
+	Host          string
+	Tool          protocol.Tool
+	Now           func() time.Time
 }
 
 func (manager Manager) Check(ctx context.Context, requested []string) protocol.Result {
@@ -61,6 +63,16 @@ func (manager Manager) Check(ctx context.Context, requested []string) protocol.R
 	checks := make([]protocol.Check, 0, len(items))
 	recommendations := []string{}
 	failures := []protocol.StructuredError{}
+	if manager.ConfigMissing {
+		status = protocol.StatusWarning
+		checks = append(checks, protocol.Check{
+			ID:     "setup:configuration",
+			Status: protocol.StatusWarning,
+			Summary: "mutation profile is absent; create " +
+				manager.ConfigPath + " before running setup apply",
+			Details: map[string]any{"path": manager.ConfigPath},
+		})
+	}
 	for _, item := range items {
 		observation, observeErr := manager.Backend.Observe(ctx, item, profile)
 		if observeErr != nil {
@@ -98,8 +110,9 @@ func (manager Manager) Check(ctx context.Context, requested []string) protocol.R
 		Host:       manager.Host, Tool: manager.Tool,
 		Checks: checks,
 		Data: map[string]any{
-			"platform":        manager.Platform,
-			"recommendations": recommendations,
+			"platform":           manager.Platform,
+			"recommendations":    recommendations,
+			"configuration_path": manager.ConfigPath,
 		},
 		Errors: failures,
 	})

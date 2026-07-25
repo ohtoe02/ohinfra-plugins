@@ -67,13 +67,62 @@ func TestDefinitionCheckWorksWithoutMutationConfig(t *testing.T) {
 	if result.Command != "setup check" || len(result.Checks) == 0 {
 		t.Fatalf("result = %#v", result)
 	}
+	foundConfigurationGuidance := false
+	for _, check := range result.Checks {
+		if check.ID == "setup:configuration" &&
+			check.Status == protocol.StatusWarning {
+			foundConfigurationGuidance = true
+		}
+	}
+	if !foundConfigurationGuidance {
+		t.Fatalf("missing mutation profile guidance: %#v", result)
+	}
+}
+
+func TestDefinitionCheckReportsExactMissingMutationProfilePath(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "missing-server-setup-base.yaml")
+	platform := Platform{ID: "ubuntu", Version: "22.04"}
+	definition := NewDefinition(Options{
+		Version: "1.0.0", ConfigPath: configPath,
+		Platform: &platform,
+		Backend:  &memoryBackend{drift: map[Item]bool{}},
+	})
+	result, err := definition.Execute(context.Background(), protocol.Invocation{
+		ProtocolVersion: protocol.ProtocolVersion,
+		RequestID:       "check-missing-config",
+		CommandPath:     []string{"setup", "check"},
+		Arguments:       []string{},
+		Options:         map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Data["configuration_path"] != configPath {
+		t.Fatalf("configuration path = %#v", result.Data["configuration_path"])
+	}
+	found := false
+	for _, check := range result.Checks {
+		if check.ID == "setup:configuration" &&
+			check.Status == protocol.StatusWarning {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("result lacks setup:configuration guidance: %#v", result)
+	}
 }
 
 func TestDefinitionRejectsStaleApplyDigestBeforeMutation(t *testing.T) {
 	t.Parallel()
 
 	configPath := filepath.Join(t.TempDir(), "server-setup-base.yaml")
-	if err := os.WriteFile(configPath, []byte("ssh_port: 22\nmanage_firewall: true\n"), 0o600); err != nil {
+	if err := os.WriteFile(configPath, []byte(
+		"ssh_port: 22\nmanage_firewall: true\nadministrators:\n"+
+			"  - name: operator\n"+
+			"    authorized_key_sources: [/etc/ohtools/plugins/keys/operator.pub]\n",
+	), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	platform := Platform{ID: "debian", Version: "12"}

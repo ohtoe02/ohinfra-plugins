@@ -193,9 +193,10 @@ func TestSystemBackendVerifiesPinnedZabbixRepositoryPackage(t *testing.T) {
 	if err := backend.Apply(context.Background(), ItemPackages, profile); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 3 || calls[0].Program != "dpkg" ||
-		!reflect.DeepEqual(calls[0].Arguments[:2], []string{"--install", "--"}) ||
-		calls[1].Program != "apt-get" || calls[2].Program != "apt-get" {
+	if len(calls) != 4 || calls[0].Program != "dpkg-query" ||
+		calls[1].Program != "dpkg" ||
+		!reflect.DeepEqual(calls[1].Arguments[:2], []string{"--install", "--"}) ||
+		calls[2].Program != "apt-get" || calls[3].Program != "apt-get" {
 		t.Fatalf("calls = %#v", calls)
 	}
 
@@ -206,8 +207,51 @@ func TestSystemBackendVerifiesPinnedZabbixRepositoryPackage(t *testing.T) {
 	}); err == nil {
 		t.Fatal("digest mismatch was accepted")
 	}
-	if len(calls) != 0 {
+	if len(calls) != 1 || calls[0].Program != "dpkg-query" {
 		t.Fatalf("commands ran after digest mismatch: %#v", calls)
+	}
+}
+
+func TestSystemBackendDoesNotReinstallPinnedZabbixRepositoryPackage(t *testing.T) {
+	t.Parallel()
+
+	downloads := 0
+	var calls []execx.Spec
+	backend := SystemBackend{
+		Root: t.TempDir(),
+		HTTPClient: httpDoerFunc(func(*http.Request) (*http.Response, error) {
+			downloads++
+			return nil, errors.New("unexpected download")
+		}),
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			calls = append(calls, spec)
+			if spec.Program == "dpkg-query" {
+				return execx.Output{
+					Stdout: []byte("zabbix-release\tinstall ok installed\n"),
+				}, nil
+			}
+			return execx.Output{}, nil
+		}),
+	}
+	config := DefaultConfig()
+	config.Zabbix = &ZabbixConfig{
+		Enabled: true, Server: "192.0.2.10", Hostname: "web-01",
+		RepositoryPackageURL:    "https://repo.zabbix.com/release.deb",
+		RepositoryPackageSize:   8,
+		RepositoryPackageSHA256: strings.Repeat("0", 64),
+	}
+	if err := backend.Apply(context.Background(), ItemPackages, Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemZabbix},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if downloads != 0 || len(calls) != 3 ||
+		calls[0].Program != "dpkg-query" ||
+		calls[1].Program != "apt-get" ||
+		calls[2].Program != "apt-get" {
+		t.Fatalf("downloads=%d calls=%#v", downloads, calls)
 	}
 }
 
@@ -435,6 +479,296 @@ func TestSystemBackendChecksLegacyEntitlementWithoutMutation(t *testing.T) {
 		ID: "ubuntu", Version: "20.04", RequiresExtendedSupport: true,
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSystemBackendAddsEarlySSHIncludeAndVerifiesEffectiveState(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	mainConfig := filepath.Join(root, "etc", "ssh", "sshd_config")
+	if err := os.MkdirAll(filepath.Dir(mainConfig), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		mainConfig,
+		[]byte("# vendor configuration\nUsePAM yes\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var calls []execx.Spec
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			calls = append(calls, spec)
+			if spec.Program == "sshd" && containsArgument(spec.Arguments, "-T") {
+				return execx.Output{Stdout: []byte(
+					"port 2222\n" +
+						"permitrootlogin prohibit-password\n" +
+						"passwordauthentication no\n" +
+						"kbdinteractiveauthentication no\n" +
+						"pubkeyauthentication yes\n",
+				)}, nil
+			}
+			return execx.Output{}, nil
+		}),
+	}
+	config := DefaultConfig()
+	config.SSHPort = 2222
+	config.ManageFirewall = true
+	config.Administrators = []Administrator{{
+		Name: "operator",
+		AuthorizedKeySources: []string{
+			"/etc/ohtools/plugins/keys/operator.pub",
+		},
+	}}
+	profile := Profile{
+		Platform: Platform{ID: "debian", Version: "10"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemUsers, ItemFirewall, ItemSSH},
+	}
+	observation, err := backend.Observe(context.Background(), ItemSSH, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Converged {
+		t.Fatal("missing SSH include and drop-in were reported as converged")
+	}
+	if err := backend.Apply(context.Background(), ItemSSH, profile); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Verify(context.Background(), ItemSSH, profile); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(mainConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const include = "Include /etc/ssh/sshd_config.d/*.conf\n"
+	if !strings.HasPrefix(string(content), include) ||
+		strings.Count(string(content), include) != 1 {
+		t.Fatalf("sshd_config = %q", content)
+	}
+	if len(calls) < 3 {
+		t.Fatalf("expected syntax, reload, and effective-state checks; calls=%#v", calls)
+	}
+}
+
+func TestSystemBackendRollsBackSSHIncludeWhenActivationFails(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	mainConfig := filepath.Join(root, "etc", "ssh", "sshd_config")
+	if err := os.MkdirAll(filepath.Dir(mainConfig), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte("# vendor configuration\n")
+	if err := os.WriteFile(mainConfig, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			if spec.Program == "sshd" && containsArgument(spec.Arguments, "-T") {
+				return execx.Output{Stdout: []byte(
+					"port 22\n" +
+						"permitrootlogin prohibit-password\n" +
+						"passwordauthentication no\n" +
+						"kbdinteractiveauthentication no\n" +
+						"pubkeyauthentication yes\n",
+				)}, nil
+			}
+			if spec.Program == "systemctl" {
+				return execx.Output{ExitCode: 1, Stderr: []byte("reload rejected")}, nil
+			}
+			return execx.Output{}, nil
+		}),
+	}
+	config := DefaultConfig()
+	config.Administrators = []Administrator{{
+		Name: "operator",
+		AuthorizedKeySources: []string{
+			"/etc/ohtools/plugins/keys/operator.pub",
+		},
+	}}
+	err := backend.Apply(context.Background(), ItemSSH, Profile{
+		Platform: Platform{ID: "debian", Version: "10"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemUsers, ItemSSH},
+	})
+	if err == nil {
+		t.Fatal("SSH activation failure was ignored")
+	}
+	content, readErr := os.ReadFile(mainConfig)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !reflect.DeepEqual(content, original) {
+		t.Fatalf("main SSH configuration was not rolled back: %q", content)
+	}
+}
+
+func TestSystemBackendBlocksForeignSSHConflictBeforeReload(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	mainConfig := filepath.Join(root, "etc", "ssh", "sshd_config")
+	if err := os.MkdirAll(filepath.Dir(mainConfig), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		mainConfig,
+		[]byte(sshIncludeDirective+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "etc", "ssh", "sshd_config.d", "60-ohtools-server-setup.conf")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previousDropIn := []byte("# previous managed state\n")
+	if err := os.WriteFile(target, previousDropIn, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reloads := 0
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			if spec.Program == "sshd" && containsArgument(spec.Arguments, "-T") {
+				return execx.Output{Stdout: []byte(
+					"port 22\n" +
+						"permitrootlogin yes\n" +
+						"passwordauthentication yes\n" +
+						"kbdinteractiveauthentication yes\n" +
+						"pubkeyauthentication yes\n",
+				)}, nil
+			}
+			if spec.Program == "systemctl" {
+				reloads++
+			}
+			return execx.Output{}, nil
+		}),
+	}
+	config := DefaultConfig()
+	config.Administrators = []Administrator{{
+		Name: "operator",
+		AuthorizedKeySources: []string{
+			"/etc/ohtools/plugins/keys/operator.pub",
+		},
+	}}
+	err := backend.Apply(context.Background(), ItemSSH, Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemUsers, ItemSSH},
+	})
+	if err == nil {
+		t.Fatal("foreign effective SSH conflict was accepted")
+	}
+	if reloads != 0 {
+		t.Fatalf("sshd reloaded before effective-state validation: %d", reloads)
+	}
+	content, readErr := os.ReadFile(target)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !reflect.DeepEqual(content, previousDropIn) {
+		t.Fatalf("managed drop-in was not restored after conflict: %q", content)
+	}
+}
+
+func TestSystemBackendPersistsFirewallWithoutSecondUpdate(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	enabled := false
+	active := false
+	daemonReloads := 0
+	enableCalls := 0
+	restartCalls := 0
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			switch {
+			case spec.Program == "nft" && containsArgument(spec.Arguments, "-c"):
+				return execx.Output{}, nil
+			case spec.Program == "nft" && containsArgument(spec.Arguments, "list"):
+				if active {
+					return execx.Output{}, nil
+				}
+				return execx.Output{ExitCode: 1}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-enabled"):
+				if enabled {
+					return execx.Output{}, nil
+				}
+				return execx.Output{ExitCode: 1}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "daemon-reload"):
+				daemonReloads++
+				return execx.Output{}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "enable"):
+				enableCalls++
+				enabled = true
+				return execx.Output{}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "restart"):
+				restartCalls++
+				active = true
+				return execx.Output{}, nil
+			default:
+				return execx.Output{}, errors.New("unexpected command")
+			}
+		}),
+	}
+	config := DefaultConfig()
+	config.ManageFirewall = true
+	profile := Profile{
+		Platform: Platform{ID: "ubuntu", Version: "24.04"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemFirewall},
+	}
+	observation, err := backend.Observe(context.Background(), ItemFirewall, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Converged {
+		t.Fatal("missing persistent firewall unit was reported as converged")
+	}
+	if err := backend.Apply(context.Background(), ItemFirewall, profile); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Verify(context.Background(), ItemFirewall, profile); err != nil {
+		t.Fatal(err)
+	}
+	second, err := backend.Observe(context.Background(), ItemFirewall, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Converged || daemonReloads != 1 || enableCalls != 1 ||
+		restartCalls != 1 {
+		t.Fatalf(
+			"second observation=%#v daemonReloads=%d enableCalls=%d restartCalls=%d",
+			second,
+			daemonReloads,
+			enableCalls,
+			restartCalls,
+		)
+	}
+	unit := filepath.Join(
+		root,
+		"etc",
+		"systemd",
+		"system",
+		"ohtools-server-setup-firewall.service",
+	)
+	content, err := os.ReadFile(unit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(
+		string(content),
+		"ExecStart=/usr/sbin/nft -f /etc/nftables.d/ohtools-server-setup.nft",
+	) {
+		t.Fatalf("firewall unit = %q", content)
 	}
 }
 

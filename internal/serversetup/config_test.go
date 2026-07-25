@@ -124,3 +124,35 @@ zabbix:
 		})
 	}
 }
+
+func TestConfigBlocksUnsafeSSHHardeningProfiles(t *testing.T) {
+	t.Parallel()
+
+	for name, content := range map[string]string{
+		"no-admin-key": `
+enabled_items: [ssh]
+ssh_port: 22
+`,
+		"new-port-without-firewall": `
+enabled_items: [ssh]
+administrators:
+  - name: operator
+    authorized_key_sources:
+      - /etc/ohtools/plugins/keys/operator.pub
+ssh_port: 2222
+manage_firewall: false
+`,
+	} {
+		name, content := name, content
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "server-setup-base.yaml")
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadConfig(path, true); err == nil {
+				t.Fatalf("unsafe SSH profile %q was accepted", name)
+			}
+		})
+	}
+}

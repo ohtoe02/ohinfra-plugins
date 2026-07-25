@@ -2,6 +2,7 @@ package serversetup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -113,6 +114,8 @@ func managerFor(options Options, requireConfig bool) (Manager, error) {
 	if configPath == "" {
 		configPath = ConfigPath
 	}
+	_, configStatErr := os.Lstat(configPath)
+	configMissing := errors.Is(configStatErr, os.ErrNotExist)
 	config, err := LoadConfig(configPath, requireConfig)
 	if err != nil {
 		return Manager{}, protocol.ExitError{
@@ -139,6 +142,7 @@ func managerFor(options Options, requireConfig bool) (Manager, error) {
 	}
 	return Manager{
 		Backend: backend, Config: config, Platform: platform, Host: host,
+		ConfigPath: configPath, ConfigMissing: configMissing,
 		Tool: protocol.Tool{
 			Name: Name, Version: options.Version, Commit: options.Commit,
 			BuildDate: options.BuildDate, GoVersion: runtime.Version(),

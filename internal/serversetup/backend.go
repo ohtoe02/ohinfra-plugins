@@ -88,6 +88,10 @@ func (backend SystemBackend) Observe(
 		return backend.observePackages(ctx, profile)
 	case ItemUsers:
 		return backend.observeUsers(ctx, profile)
+	case ItemSSH:
+		return backend.observeSSH(ctx, profile)
+	case ItemFirewall:
+		return backend.observeFirewall(ctx, profile)
 	default:
 		managed, err := backend.desiredFile(item, profile)
 		if err != nil {
@@ -118,6 +122,10 @@ func (backend SystemBackend) Apply(
 		return backend.applyPackages(ctx, profile)
 	case ItemUsers:
 		return backend.applyUsers(ctx, profile)
+	case ItemSSH:
+		return backend.applySSH(ctx, profile)
+	case ItemFirewall:
+		return backend.applyFirewall(ctx, profile)
 	default:
 		managed, err := backend.desiredFile(item, profile)
 		if err != nil {
@@ -128,6 +136,467 @@ func (backend SystemBackend) Apply(
 		}
 		return backend.activateManagedFile(ctx, *managed)
 	}
+}
+
+const sshIncludeDirective = "Include /etc/ssh/sshd_config.d/*.conf"
+
+type sshIncludeChange struct {
+	target  string
+	backup  string
+	changed bool
+}
+
+type fileSnapshot struct {
+	path    string
+	content []byte
+	mode    fs.FileMode
+	existed bool
+}
+
+func (backend SystemBackend) applySSH(
+	ctx context.Context,
+	profile Profile,
+) error {
+	managed, err := backend.desiredFile(ItemSSH, profile)
+	if err != nil {
+		return err
+	}
+	snapshot, err := captureFileSnapshot(backend.path(managed.Path))
+	if err != nil {
+		return err
+	}
+	include, err := backend.beginSSHInclude(ctx)
+	if err != nil {
+		return err
+	}
+	managed.Activation = nil
+	if err := backend.activateManagedFile(ctx, *managed); err != nil {
+		return errors.Join(err, include.rollback())
+	}
+	effective, err := backend.effectiveSSHConverged(ctx, profile.Config.SSHPort)
+	if err != nil || !effective {
+		if err == nil {
+			err = errors.New(
+				"foreign SSH configuration conflicts with the managed hardening profile",
+			)
+		}
+		return errors.Join(
+			err,
+			restoreFileSnapshot(snapshot),
+			include.rollback(),
+		)
+	}
+	if _, err := backend.run(ctx, execx.Spec{
+		Program: "systemctl", Arguments: []string{"reload", "ssh.service"},
+	}); err != nil {
+		return errors.Join(
+			err,
+			restoreFileSnapshot(snapshot),
+			include.rollback(),
+		)
+	}
+	return include.commit()
+}
+
+func captureFileSnapshot(path string) (fileSnapshot, error) {
+	snapshot := fileSnapshot{path: path}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return snapshot, nil
+	}
+	if err != nil {
+		return snapshot, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() ||
+		info.Size() > 1<<20 {
+		return snapshot, fmt.Errorf("managed path %s is unsafe", path)
+	}
+	content, err := os.ReadFile(path) // #nosec G304 -- fixed managed path.
+	if err != nil {
+		return snapshot, err
+	}
+	snapshot.content = content
+	snapshot.mode = info.Mode().Perm()
+	snapshot.existed = true
+	return snapshot, nil
+}
+
+func restoreFileSnapshot(snapshot fileSnapshot) error {
+	if !snapshot.existed {
+		if err := os.Remove(snapshot.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return syncDirectory(filepath.Dir(snapshot.path))
+	}
+	return writeFileAtomic(snapshot.path, snapshot.content, snapshot.mode)
+}
+
+func (backend SystemBackend) observeFirewall(
+	ctx context.Context,
+	profile Profile,
+) (Observation, error) {
+	files, err := backend.firewallFiles(profile)
+	if err != nil {
+		return Observation{}, err
+	}
+	for _, managed := range files {
+		converged, err := backend.fileConverged(managed)
+		if err != nil {
+			return Observation{}, err
+		}
+		if !converged {
+			return Observation{
+				Converged: false,
+				Summary:   "firewall persistence differs from the desired state",
+			}, nil
+		}
+	}
+	enabled, err := backend.runRaw(ctx, execx.Spec{
+		Program: "systemctl",
+		Arguments: []string{
+			"is-enabled", "--", "ohtools-server-setup-firewall.service",
+		},
+	})
+	if err != nil {
+		return Observation{}, err
+	}
+	if enabled.ExitCode != 0 && enabled.ExitCode != 1 {
+		return Observation{}, fmt.Errorf(
+			"inspect firewall service enablement: exit %d",
+			enabled.ExitCode,
+		)
+	}
+	active, err := backend.runRaw(ctx, execx.Spec{
+		Program: "nft",
+		Arguments: []string{
+			"list", "table", "inet", "ohtools_server_setup",
+		},
+	})
+	if err != nil {
+		return Observation{}, err
+	}
+	if active.ExitCode != 0 && active.ExitCode != 1 {
+		return Observation{}, fmt.Errorf(
+			"inspect managed firewall table: exit %d",
+			active.ExitCode,
+		)
+	}
+	converged := enabled.ExitCode == 0 && active.ExitCode == 0
+	summary := "firewall service or active rules differ from the desired state"
+	if converged {
+		summary = "firewall persistence and active rules match the desired state"
+	}
+	return Observation{Converged: converged, Summary: summary}, nil
+}
+
+func (backend SystemBackend) applyFirewall(
+	ctx context.Context,
+	profile Profile,
+) error {
+	files, err := backend.firewallFiles(profile)
+	if err != nil {
+		return err
+	}
+	snapshots := make([]fileSnapshot, 0, len(files))
+	unitChanged := false
+	for _, managed := range files {
+		snapshot, err := captureFileSnapshot(backend.path(managed.Path))
+		if err != nil {
+			return err
+		}
+		snapshots = append(snapshots, snapshot)
+		converged, err := backend.fileConverged(managed)
+		if err != nil {
+			return err
+		}
+		if converged {
+			continue
+		}
+		if managed.Path == "/etc/systemd/system/ohtools-server-setup-firewall.service" {
+			unitChanged = true
+		}
+		managed.Activation = nil
+		if err := backend.activateManagedFile(ctx, managed); err != nil {
+			return errors.Join(err, backend.rollbackFirewall(ctx, snapshots, unitChanged))
+		}
+	}
+	if unitChanged {
+		if _, err := backend.run(ctx, execx.Spec{
+			Program: "systemctl", Arguments: []string{"daemon-reload"},
+		}); err != nil {
+			return errors.Join(err, backend.rollbackFirewall(ctx, snapshots, unitChanged))
+		}
+	}
+	if _, err := backend.run(ctx, execx.Spec{
+		Program: "systemctl",
+		Arguments: []string{
+			"enable", "--", "ohtools-server-setup-firewall.service",
+		},
+	}); err != nil {
+		return errors.Join(err, backend.rollbackFirewall(ctx, snapshots, unitChanged))
+	}
+	if _, err := backend.run(ctx, execx.Spec{
+		Program: "systemctl",
+		Arguments: []string{
+			"restart", "--", "ohtools-server-setup-firewall.service",
+		},
+	}); err != nil {
+		return errors.Join(err, backend.rollbackFirewall(ctx, snapshots, unitChanged))
+	}
+	return nil
+}
+
+func (backend SystemBackend) rollbackFirewall(
+	ctx context.Context,
+	snapshots []fileSnapshot,
+	unitChanged bool,
+) error {
+	restoreErr := restoreFileSnapshots(snapshots)
+	if !unitChanged {
+		return restoreErr
+	}
+	_, reloadErr := backend.run(ctx, execx.Spec{
+		Program: "systemctl", Arguments: []string{"daemon-reload"},
+	})
+	return errors.Join(restoreErr, reloadErr)
+}
+
+func (backend SystemBackend) firewallFiles(profile Profile) ([]managedFile, error) {
+	rules, err := backend.desiredFile(ItemFirewall, profile)
+	if err != nil {
+		return nil, err
+	}
+	rules.Activation = nil
+	service := managedFile{
+		Path: "/etc/systemd/system/ohtools-server-setup-firewall.service",
+		Mode: 0o644,
+		Content: []byte(
+			"[Unit]\n" +
+				"Description=ohtools managed firewall rules\n" +
+				"After=network-pre.target\n" +
+				"Before=network.target\n\n" +
+				"[Service]\n" +
+				"Type=oneshot\n" +
+				"RemainAfterExit=yes\n" +
+				"ExecStartPre=-/usr/sbin/nft delete table inet ohtools_server_setup\n" +
+				"ExecStart=/usr/sbin/nft -f /etc/nftables.d/ohtools-server-setup.nft\n\n" +
+				"[Install]\n" +
+				"WantedBy=multi-user.target\n",
+		),
+	}
+	return []managedFile{*rules, service}, nil
+}
+
+func restoreFileSnapshots(snapshots []fileSnapshot) error {
+	var failures []error
+	for index := len(snapshots) - 1; index >= 0; index-- {
+		if err := restoreFileSnapshot(snapshots[index]); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (backend SystemBackend) observeSSH(
+	ctx context.Context,
+	profile Profile,
+) (Observation, error) {
+	managed, err := backend.desiredFile(ItemSSH, profile)
+	if err != nil {
+		return Observation{}, err
+	}
+	fileMatches, err := backend.fileConverged(*managed)
+	if err != nil {
+		return Observation{}, err
+	}
+	includePresent, err := backend.sshIncludePresent()
+	if err != nil {
+		return Observation{}, err
+	}
+	if !fileMatches || !includePresent {
+		return Observation{
+			Converged: false,
+			Summary:   "ssh configuration differs from the desired state",
+		}, nil
+	}
+	effective, err := backend.effectiveSSHConverged(ctx, profile.Config.SSHPort)
+	if err != nil {
+		return Observation{}, err
+	}
+	if !effective {
+		return Observation{}, errors.New(
+			"foreign SSH configuration conflicts with the managed hardening profile",
+		)
+	}
+	return Observation{
+		Converged: true,
+		Summary:   "ssh configuration matches the desired effective state",
+	}, nil
+}
+
+func (backend SystemBackend) sshIncludePresent() (bool, error) {
+	target := backend.path("/etc/ssh/sshd_config")
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() ||
+		info.Size() > 1<<20 ||
+		runtime.GOOS != "windows" && info.Mode().Perm()&0o022 != 0 {
+		return false, errors.New("main SSH configuration is unsafe")
+	}
+	content, err := os.ReadFile(target) // #nosec G304 -- fixed system configuration path.
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return strings.EqualFold(line, sshIncludeDirective), nil
+	}
+	return false, nil
+}
+
+func (backend SystemBackend) beginSSHInclude(
+	ctx context.Context,
+) (change sshIncludeChange, returnErr error) {
+	target := backend.path("/etc/ssh/sshd_config")
+	change.target = target
+	includePresent, err := backend.sshIncludePresent()
+	if err != nil {
+		return change, err
+	}
+	if includePresent {
+		return change, nil
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		return change, fmt.Errorf("inspect main SSH configuration: %w", err)
+	}
+	original, err := os.ReadFile(target) // #nosec G304 -- fixed system configuration path.
+	if err != nil {
+		return change, err
+	}
+	directory := filepath.Dir(target)
+	if err := secureMkdirAll(backend.path("/etc/ssh/sshd_config.d"), 0o755); err != nil {
+		return change, err
+	}
+	staged, err := os.OpenFile(
+		target+".ohtools-include.stage",
+		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+		0o600,
+	)
+	if err != nil {
+		return change, fmt.Errorf("stage main SSH configuration: %w", err)
+	}
+	stagedPath := staged.Name()
+	defer func() {
+		if cleanupErr := os.Remove(stagedPath); cleanupErr != nil &&
+			!errors.Is(cleanupErr, os.ErrNotExist) {
+			returnErr = errors.Join(returnErr, cleanupErr)
+		}
+	}()
+	content := append([]byte(sshIncludeDirective+"\n"), original...)
+	if _, err := staged.Write(content); err != nil {
+		_ = staged.Close()
+		return change, err
+	}
+	if err := staged.Sync(); err != nil {
+		_ = staged.Close()
+		return change, err
+	}
+	if err := staged.Chmod(info.Mode().Perm()); err != nil {
+		_ = staged.Close()
+		return change, err
+	}
+	if err := staged.Close(); err != nil {
+		return change, err
+	}
+	if _, err := backend.run(ctx, execx.Spec{
+		Program: "sshd", Arguments: []string{"-t", "-f", stagedPath},
+	}); err != nil {
+		return change, fmt.Errorf("validate main SSH configuration: %w", err)
+	}
+	change.backup = target + ".ohtools-include.rollback"
+	if _, err := os.Lstat(change.backup); err == nil {
+		return change, errors.New("stale SSH include rollback file requires recovery")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return change, err
+	}
+	if err := os.Rename(target, change.backup); err != nil {
+		return change, err
+	}
+	change.changed = true
+	if err := syncDirectory(directory); err != nil {
+		return change, errors.Join(err, change.rollback())
+	}
+	if err := os.Rename(stagedPath, target); err != nil {
+		return change, errors.Join(err, change.rollback())
+	}
+	if err := syncDirectory(directory); err != nil {
+		return change, errors.Join(err, change.rollback())
+	}
+	return change, nil
+}
+
+func (change sshIncludeChange) rollback() error {
+	if !change.changed {
+		return nil
+	}
+	var failures []error
+	if err := os.Remove(change.target); err != nil && !errors.Is(err, os.ErrNotExist) {
+		failures = append(failures, err)
+	}
+	if err := os.Rename(change.backup, change.target); err != nil {
+		failures = append(failures, err)
+	}
+	if err := syncDirectory(filepath.Dir(change.target)); err != nil {
+		failures = append(failures, err)
+	}
+	return errors.Join(failures...)
+}
+
+func (change sshIncludeChange) commit() error {
+	if !change.changed {
+		return nil
+	}
+	if err := os.Remove(change.backup); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(change.target))
+}
+
+func (backend SystemBackend) effectiveSSHConverged(
+	ctx context.Context,
+	port int,
+) (bool, error) {
+	output, err := backend.run(ctx, execx.Spec{
+		Program: "sshd",
+		Arguments: []string{
+			"-T", "-f", backend.path("/etc/ssh/sshd_config"),
+		},
+	})
+	if err != nil {
+		return false, fmt.Errorf("inspect effective SSH configuration: %w", err)
+	}
+	values := map[string]string{}
+	for _, line := range strings.Split(string(output.Stdout), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) >= 2 {
+			values[strings.ToLower(fields[0])] = strings.ToLower(fields[1])
+		}
+	}
+	rootLogin := values["permitrootlogin"]
+	return values["port"] == fmt.Sprintf("%d", port) &&
+		(rootLogin == "prohibit-password" || rootLogin == "without-password") &&
+		values["passwordauthentication"] == "no" &&
+		values["kbdinteractiveauthentication"] == "no" &&
+		values["pubkeyauthentication"] == "yes", nil
 }
 
 func (backend SystemBackend) Verify(
@@ -192,8 +661,14 @@ func (backend SystemBackend) applyPackages(ctx context.Context, profile Profile)
 		return nil
 	}
 	if slices.Contains(profile.Items, ItemZabbix) {
-		if err := backend.installZabbixRepository(ctx, profile.Config); err != nil {
+		installed, err := backend.packageInstalled(ctx, "zabbix-release")
+		if err != nil {
 			return err
+		}
+		if !installed {
+			if err := backend.installZabbixRepository(ctx, profile.Config); err != nil {
+				return err
+			}
 		}
 	}
 	environment := map[string]string{"DEBIAN_FRONTEND": "noninteractive"}
@@ -208,6 +683,36 @@ func (backend SystemBackend) applyPackages(ctx context.Context, profile Profile)
 		Program: "apt-get", Arguments: arguments, Environment: environment,
 	})
 	return err
+}
+
+func (backend SystemBackend) packageInstalled(
+	ctx context.Context,
+	name string,
+) (bool, error) {
+	output, err := backend.runRaw(ctx, execx.Spec{
+		Program: "dpkg-query",
+		Arguments: []string{
+			"--show", "--showformat=${binary:Package}\\t${db:Status}\\n", "--", name,
+		},
+	})
+	if err != nil {
+		return false, err
+	}
+	if output.ExitCode != 0 && output.ExitCode != 1 {
+		return false, fmt.Errorf(
+			"dpkg-query exited with %d: %s",
+			output.ExitCode,
+			strings.TrimSpace(string(output.Stderr)),
+		)
+	}
+	for _, line := range strings.Split(string(output.Stdout), "\n") {
+		packageName, status, found := strings.Cut(line, "\t")
+		if found && packageName == name &&
+			strings.TrimSpace(status) == "install ok installed" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (backend SystemBackend) installZabbixRepository(ctx context.Context, config Config) error {
@@ -337,6 +842,7 @@ func desiredPackages(profile Profile) []string {
 		case ItemSysctl:
 			set["procps"] = true
 		case ItemZabbix:
+			set["zabbix-release"] = true
 			set["zabbix-agent2"] = true
 		}
 	}
@@ -871,7 +1377,7 @@ func writeFileAtomic(target string, content []byte, mode fs.FileMode) (returnErr
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(staged, target); err != nil {
+	if err := replaceFile(staged, target); err != nil {
 		return err
 	}
 	return syncDirectory(filepath.Dir(target))
