@@ -1,0 +1,89 @@
+{
+  "schema_version": "1",
+  "result_status_exit_codes": [
+    {
+      "status": "pass",
+      "exit_code": 0
+    },
+    {
+      "status": "info",
+      "exit_code": 0
+    },
+    {
+      "status": "warning",
+      "exit_code": 5
+    },
+    {
+      "status": "critical",
+      "exit_code": 6
+    },
+    {
+      "status": "cancelled",
+      "exit_code": 7
+    },
+    {
+      "status": "partial",
+      "exit_code": 9
+    }
+  ],
+  "error_kind_exit_codes": [
+    {
+      "kind": "general",
+      "exit_code": 1
+    },
+    {
+      "kind": "invalid_arguments",
+      "exit_code": 2
+    },
+    {
+      "kind": "insufficient_privileges",
+      "exit_code": 3
+    },
+    {
+      "kind": "missing_dependency",
+      "exit_code": 4
+    },
+    {
+      "kind": "cancelled",
+      "exit_code": 7
+    },
+    {
+      "kind": "timeout",
+      "exit_code": 8
+    },
+    {
+      "kind": "configuration",
+      "exit_code": 10
+    }
+  ],
+  "process_failure_kind": [
+    {
+      "process_exit_code": 2,
+      "kind": "invalid_arguments"
+    },
+    {
+      "process_exit_code": 3,
+      "kind": "insufficient_privileges"
+    },
+    {
+      "process_exit_code": 4,
+      "kind": "missing_dependency"
+    },
+    {
+      "process_exit_code": 7,
+      "kind": "cancelled"
+    },
+    {
+      "process_exit_code": 8,
+      "kind": "timeout"
+    },
+    {
+      "process_exit_code": 10,
+      "kind": "configuration"
+    },
+    {
+      "process_exit_code": 9,
+      "kind": "general"
+    }
+  ]
+}
