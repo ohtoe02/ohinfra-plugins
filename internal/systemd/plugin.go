@@ -30,14 +30,16 @@ func DefaultConfig() Config {
 }
 
 type Options struct {
-	Version    string
-	Commit     string
-	BuildDate  string
-	ConfigPath string
-	Runner     execx.Runner
-	Host       string
-	Now        func() time.Time
-	Sleep      func(context.Context, time.Duration) error
+	Version         string
+	Commit          string
+	BuildDate       string
+	ConfigPath      string
+	Runner          execx.Runner
+	Inspector       Inspector
+	MutationBackend MutationBackend
+	Host            string
+	Now             func() time.Time
+	Sleep           func(context.Context, time.Duration) error
 }
 
 func NewDefinition(options Options) protocol.Definition {
@@ -49,6 +51,12 @@ func NewDefinition(options Options) protocol.Definition {
 	}
 	if options.Runner == nil {
 		options.Runner = execx.OSRunner{Resolver: execx.SystemResolver()}
+	}
+	if options.Inspector == nil {
+		options.Inspector = commandInspector{runner: options.Runner}
+	}
+	if options.MutationBackend == nil {
+		options.MutationBackend = commandMutationBackend{runner: options.Runner}
 	}
 	if options.Host == "" {
 		options.Host, _ = os.Hostname()
@@ -89,7 +97,7 @@ func NewDefinition(options Options) protocol.Definition {
 				if err != nil {
 					return protocol.Plan{}, err
 				}
-				return manager.RestartPlan(ctx, unit)
+				return (RestartPlanner{Inspector: manager.Inspector}).Plan(ctx, unit)
 			},
 			func(ctx context.Context, invocation protocol.Invocation, plan protocol.Plan) (protocol.Result, error) {
 				manager, _, err := managerFor(options)
@@ -149,7 +157,7 @@ func managerFor(options Options) (Manager, Config, error) {
 		}
 	}
 	return Manager{
-		Runner: options.Runner, Host: options.Host,
+		Inspector: options.Inspector, MutationBackend: options.MutationBackend, Host: options.Host,
 		Tool: protocol.Tool{
 			Name: Name, Version: options.Version, Commit: options.Commit,
 			BuildDate: options.BuildDate, GoVersion: runtime.Version(), Architecture: runtime.GOARCH,

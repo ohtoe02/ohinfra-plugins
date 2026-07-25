@@ -63,12 +63,12 @@ func TestMutationUsesOneRiskSourceAndReplansBeforeApply(t *testing.T) {
 
 	plans := []Plan{
 		{
-			CommandID: "fixture.apply",
+			CommandID: "domain.supplied",
 			Summary:   "Apply fixture",
 			Changes:   []Change{{Object: "fixture", Action: "write", Status: "planned"}},
 		},
 		{
-			CommandID: "fixture.apply",
+			CommandID: "changed.by.domain",
 			Summary:   "Apply fixture",
 			Changes:   []Change{{Object: "fixture", Action: "write", Status: "planned"}},
 		},
@@ -116,6 +116,9 @@ func TestMutationUsesOneRiskSourceAndReplansBeforeApply(t *testing.T) {
 	if !plan.RequiresRoot || !plan.RequiresForce || !plan.RequiresConfirmation {
 		t.Fatalf("plan risk flags = %#v", plan)
 	}
+	if plan.CommandID != "fixture.apply" {
+		t.Fatalf("plan command_id = %q, want registry-derived fixture.apply", plan.CommandID)
+	}
 	invocation.PlanDigest, err = PlanDigest(plan)
 	if err != nil {
 		t.Fatal(err)
@@ -132,8 +135,8 @@ func TestMutationRejectsPlanThatChangedAfterApproval(t *testing.T) {
 	t.Parallel()
 
 	plans := []Plan{
-		{CommandID: "fixture.apply", Summary: "first"},
-		{CommandID: "fixture.apply", Summary: "changed"},
+		{CommandID: "domain.first", Summary: "first"},
+		{CommandID: "domain.second", Summary: "changed"},
 	}
 	planCalls := 0
 	applyCalls := 0

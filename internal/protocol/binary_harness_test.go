@@ -2,8 +2,10 @@ package protocol_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -12,6 +14,11 @@ import (
 	"time"
 
 	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
+)
+
+const (
+	harnessOutputLimitExit = -100
+	harnessTimeoutExit     = -101
 )
 
 func TestTrustedProtocolFixtureRealBinary(t *testing.T) {
@@ -34,7 +41,7 @@ func TestTrustedProtocolFixtureRealBinary(t *testing.T) {
 	if err := json.Unmarshal(manifestJSON, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Name != "protocol-fixture" || len(manifest.Commands) != 2 {
+	if manifest.Name != "protocol-fixture" || len(manifest.Commands) != 3 {
 		t.Fatalf("manifest = %#v", manifest)
 	}
 
@@ -60,8 +67,31 @@ func TestTrustedProtocolFixtureRealBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	largeOutput, stderr, exit := runFixture(t, binary, "execute", encodedOutput)
-	if exit != 0 || len(stderr) != 0 || len(largeOutput) <= 1<<20 {
-		t.Fatalf("large output fixture exit=%d stdout=%d stderr=%q", exit, len(largeOutput), stderr)
+	if exit != harnessOutputLimitExit || len(largeOutput) > 1<<20 {
+		t.Fatalf("output limit exit=%d stdout=%d stderr=%q", exit, len(largeOutput), stderr)
+	}
+
+	hangMarker := filepath.Join(t.TempDir(), "hang.lock")
+	hangInvocation := protocol.Invocation{
+		ProtocolVersion: protocol.ProtocolVersion,
+		RequestID:       "fixture-hang-1",
+		CommandPath:     []string{"fixture", "hang"},
+		Arguments:       []string{hangMarker},
+		Options:         map[string]any{},
+		Deadline:        time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano),
+	}
+	encodedHang, err := json.Marshal(hangInvocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, exit = runFixtureWithLimits(
+		t, binary, "execute", encodedHang, time.Second, 1<<20, 1<<20,
+	)
+	if exit != harnessTimeoutExit {
+		t.Fatalf("hanging fixture exit=%d, want harness timeout", exit)
+	}
+	if err := os.Remove(hangMarker); err != nil {
+		t.Fatalf("hanging fixture resource was not released after termination: %v", err)
 	}
 
 	statePath := filepath.Join(t.TempDir(), "state")
@@ -141,13 +171,41 @@ func TestTrustedProtocolFixtureRealBinary(t *testing.T) {
 
 func runFixture(t *testing.T, binary, verb string, stdin []byte) ([]byte, []byte, int) {
 	t.Helper()
-	command := exec.Command(binary, verb, "--protocol=1")
+	return runFixtureWithLimits(t, binary, verb, stdin, 5*time.Second, 1<<20, 1<<20)
+}
+
+func runFixtureWithLimits(
+	t *testing.T,
+	binary string,
+	verb string,
+	stdin []byte,
+	timeout time.Duration,
+	stdoutLimit int,
+	stderrLimit int,
+) ([]byte, []byte, int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, binary, verb, "--protocol=1")
 	command.Stdin = bytes.NewReader(stdin)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
+	stdout := boundedBuffer{limit: stdoutLimit, cancel: cancel}
+	stderr := boundedBuffer{limit: stderrLimit, cancel: cancel}
 	command.Stdout = &stdout
 	command.Stderr = &stderr
+	command.WaitDelay = 500 * time.Millisecond
 	err := command.Run()
+	if stdout.exceeded || stderr.exceeded {
+		if command.ProcessState == nil || !command.ProcessState.Exited() {
+			t.Fatal("output-limited fixture process was not reaped")
+		}
+		return stdout.Bytes(), stderr.Bytes(), harnessOutputLimitExit
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if command.ProcessState == nil || !command.ProcessState.Exited() {
+			t.Fatal("timed-out fixture process was not reaped")
+		}
+		return stdout.Bytes(), stderr.Bytes(), harnessTimeoutExit
+	}
 	if err == nil {
 		return stdout.Bytes(), stderr.Bytes(), 0
 	}
@@ -159,4 +217,35 @@ func runFixture(t *testing.T, binary, verb string, stdin []byte) ([]byte, []byte
 		t.Fatalf("fixture failed without diagnostic: %v", err)
 	}
 	return stdout.Bytes(), stderr.Bytes(), exitError.ExitCode()
+}
+
+type boundedBuffer struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+	cancel   context.CancelFunc
+}
+
+func (buffer *boundedBuffer) Write(value []byte) (int, error) {
+	remaining := buffer.limit - buffer.buffer.Len()
+	if remaining < 0 {
+		remaining = 0
+	}
+	if len(value) > remaining {
+		if remaining != 0 {
+			_, _ = buffer.buffer.Write(value[:remaining])
+		}
+		buffer.exceeded = true
+		buffer.cancel()
+		return len(value), nil
+	}
+	return buffer.buffer.Write(value)
+}
+
+func (buffer *boundedBuffer) Bytes() []byte {
+	return buffer.buffer.Bytes()
+}
+
+func (buffer *boundedBuffer) String() string {
+	return buffer.buffer.String()
 }
