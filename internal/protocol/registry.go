@@ -202,10 +202,10 @@ func validateInvocation(command Command, invocation Invocation, mutation bool) e
 		}
 	}
 	if mutation && invocation.PlanDigest == "" {
-		return argumentFailure("mutation execution requires an approved plan digest")
+		return argumentFailure("mutation execution requires an approved plan_digest")
 	}
 	if !mutation && invocation.PlanDigest != "" {
-		return argumentFailure("diagnostic execution must not include a plan digest")
+		return argumentFailure("planning must not include plan_digest")
 	}
 	return nil
 }
