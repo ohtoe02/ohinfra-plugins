@@ -151,6 +151,18 @@ func BuildReleaseMetadata(
 		parsedURL.User != nil || parsedURL.RawQuery != "" || parsedURL.Fragment != "" {
 		return ReleaseMetadata{}, errors.New("release asset URL must be HTTPS without credentials, query, or fragment")
 	}
+	expectedAssetURL := fmt.Sprintf(
+		"https://github.com/ohtoe02/ohtools-plugins/releases/download/%s-v%s/%s_linux_amd64",
+		entry.Name,
+		version,
+		entry.Name,
+	)
+	if assetURL != expectedAssetURL {
+		return ReleaseMetadata{}, fmt.Errorf(
+			"release asset URL must be the immutable first-party URL %q",
+			expectedAssetURL,
+		)
+	}
 	if publishedAt.IsZero() {
 		return ReleaseMetadata{}, errors.New("published_at must not be zero")
 	}

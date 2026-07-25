@@ -70,25 +70,10 @@ func Serve(
 			_, _ = fmt.Fprintln(stderr, "invocation exceeds 1048576 bytes")
 			return ExitArguments
 		}
-		var invocation Invocation
-		if err := strictjson.Decode(encoded, &invocation); err != nil {
+		invocation, err := decodeInvocation(encoded)
+		if err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
 			return ExitArguments
-		}
-		if invocation.ProtocolVersion != ProtocolVersion {
-			_, _ = fmt.Fprintln(stderr, "unsupported protocol version")
-			return ExitArguments
-		}
-		if invocation.RequestID == "" || len(invocation.RequestID) > 128 ||
-			strings.TrimSpace(invocation.RequestID) != invocation.RequestID {
-			_, _ = fmt.Fprintln(stderr, "request_id must be a non-empty value of at most 128 bytes")
-			return ExitArguments
-		}
-		if invocation.Arguments == nil {
-			invocation.Arguments = []string{}
-		}
-		if invocation.Options == nil {
-			invocation.Options = map[string]any{}
 		}
 		ctx, cancel, err := invocationContext(invocation)
 		if err != nil {
@@ -130,6 +115,40 @@ func Serve(
 		_, _ = fmt.Fprintln(stderr, "unsupported protocol verb")
 		return ExitArguments
 	}
+}
+
+func decodeInvocation(encoded []byte) (Invocation, error) {
+	var invocation Invocation
+	if err := strictjson.Decode(encoded, &invocation); err != nil {
+		return Invocation{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return Invocation{}, err
+	}
+	for _, field := range []string{
+		"protocol_version",
+		"request_id",
+		"command_path",
+		"arguments",
+		"options",
+	} {
+		raw, present := fields[field]
+		if !present {
+			return Invocation{}, fmt.Errorf("missing invocation field %q", field)
+		}
+		if strings.TrimSpace(string(raw)) == "null" {
+			return Invocation{}, fmt.Errorf("invocation field %q must not be null", field)
+		}
+	}
+	if invocation.ProtocolVersion != ProtocolVersion {
+		return Invocation{}, errors.New("unsupported protocol version")
+	}
+	if invocation.RequestID == "" || len(invocation.RequestID) > 128 ||
+		strings.TrimSpace(invocation.RequestID) != invocation.RequestID {
+		return Invocation{}, errors.New("request_id must be a non-empty value of at most 128 bytes")
+	}
+	return invocation, nil
 }
 
 func PlanDigest(plan Plan) (string, error) {

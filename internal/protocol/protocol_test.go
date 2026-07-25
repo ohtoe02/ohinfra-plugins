@@ -185,6 +185,10 @@ func TestServeExecuteStrictlyDecodesInvocationAndNormalizesResult(t *testing.T) 
 		`{"protocol_version":1,"unknown":true}`,
 		`{"protocol_version":1,"protocol_version":1}`,
 		`{"protocol_version":1} {}`,
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],"arguments":null,"options":{}}`,
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],"options":{}}`,
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],"arguments":[],"options":null}`,
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],"arguments":[]}`,
 		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],"arguments":[],"options":{}}` +
 			strings.Repeat(" ", 1<<20),
 	} {

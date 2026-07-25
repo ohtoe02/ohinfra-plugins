@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ohtoe02/ohtools-plugin-catalog
-          ref: 1cc324c5f62328b6edebebc6360b7d47c593ba19
+          ref: 4e5bd075783fc04e305de380b1128d40d68db377
           path: .catalog-contract-source
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5

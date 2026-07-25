@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/ohtoe02/ohtools-plugins/internal/strictjson"
 )
 
 type manifestConformance struct {
@@ -208,17 +206,17 @@ func TestVendoredExitBehaviorConformance(t *testing.T) {
 		t.Fatalf("invalid exit-behavior vector header: %#v", vectors)
 	}
 	for _, test := range vectors.ResultStatusExitCode {
-		if got := conformanceStatusExit(test.Status); got != test.ExitCode {
+		if got := resultExitCode(test.Status, ""); got != test.ExitCode {
 			t.Errorf("status %q exit=%d want=%d", test.Status, got, test.ExitCode)
 		}
 	}
 	for _, test := range vectors.ErrorKindExitCode {
-		if got := conformanceErrorExit(test.Kind); got != test.ExitCode {
+		if got := errorKindExitCode(test.Kind); got != test.ExitCode {
 			t.Errorf("error kind %q exit=%d want=%d", test.Kind, got, test.ExitCode)
 		}
 	}
 	for _, test := range vectors.ProcessFailureKind {
-		if got := conformanceProcessFailureKind(test.ProcessExitCode); got != test.Kind {
+		if got := processFailureKind(test.ProcessExitCode); got != test.Kind {
 			t.Errorf("process exit %d kind=%q want=%q", test.ProcessExitCode, got, test.Kind)
 		}
 	}
@@ -250,8 +248,8 @@ func assertConformanceValidity(t *testing.T, err error, valid bool, contains str
 }
 
 func validateInvocationVector(encoded, phase string) error {
-	var invocation Invocation
-	if err := strictjson.Decode([]byte(encoded), &invocation); err != nil {
+	invocation, err := decodeInvocation([]byte(encoded))
+	if err != nil {
 		return err
 	}
 	_, cancel, err := invocationContext(invocation)
@@ -280,61 +278,6 @@ func validateInvocationVector(encoded, phase string) error {
 		return validateInvocation(command, invocation, true)
 	default:
 		return errors.New("unknown invocation conformance phase")
-	}
-}
-
-func conformanceStatusExit(status Status) int {
-	switch status {
-	case StatusPass, StatusInfo:
-		return ExitOK
-	case StatusWarning:
-		return ExitWarning
-	case StatusCritical:
-		return ExitCritical
-	case StatusCancelled:
-		return ExitCancelled
-	case StatusPartial:
-		return ExitPartial
-	default:
-		return ExitGeneral
-	}
-}
-
-func conformanceErrorExit(kind ErrorKind) int {
-	switch kind {
-	case ErrorArguments:
-		return ExitArguments
-	case ErrorPrivilege:
-		return ExitPrivilege
-	case ErrorDependency:
-		return ExitDependency
-	case ErrorCancelled:
-		return ExitCancelled
-	case ErrorTimeout:
-		return ExitTimeout
-	case ErrorConfiguration:
-		return ExitConfiguration
-	default:
-		return ExitGeneral
-	}
-}
-
-func conformanceProcessFailureKind(exitCode int) ErrorKind {
-	switch exitCode {
-	case ExitArguments:
-		return ErrorArguments
-	case ExitPrivilege:
-		return ErrorPrivilege
-	case ExitDependency:
-		return ErrorDependency
-	case ExitCancelled:
-		return ErrorCancelled
-	case ExitTimeout:
-		return ErrorTimeout
-	case ExitConfiguration:
-		return ErrorConfiguration
-	default:
-		return ErrorGeneral
 	}
 }
 

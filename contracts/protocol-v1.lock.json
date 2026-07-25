@@ -1,6 +1,6 @@
 {
   "schema_version": "1",
   "source_repository": "ohtoe02/ohtools-plugin-catalog",
-  "source_commit": "1cc324c5f62328b6edebebc6360b7d47c593ba19",
-  "bundle_sha256": "2809d0d387d160f87cb7f003564f9ad5a735eed4f1c989941a994e7f19e6db42"
+  "source_commit": "4e5bd075783fc04e305de380b1128d40d68db377",
+  "bundle_sha256": "d48ec2ca57183f65a89a307d930b5b98538f188a9e98f2796dc0221aa3eddc58"
 }
