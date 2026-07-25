@@ -160,6 +160,20 @@ func publishRelease(ctx context.Context, runner ghRunner, options publishOptions
 		}
 		return fmt.Errorf("inspect created draft release: %w", err)
 	}
+	if !state.draft {
+		if err := verifyPublishedRelease(
+			ctx,
+			runner,
+			options.Repository,
+			options,
+			state,
+			assets,
+			workspace,
+		); err != nil {
+			return fmt.Errorf("verify already-published release: %w", err)
+		}
+		return nil
+	}
 	if err := validateDraftState(state, options); err != nil {
 		return err
 	}
@@ -187,16 +201,74 @@ func publishRelease(ctx context.Context, runner ghRunner, options publishOptions
 		"--repo", options.Repository,
 		"--draft=false",
 	); err != nil {
-		return fmt.Errorf("publish verified draft release: %w", err)
+		published, inspectErr := inspectRelease(
+			ctx,
+			runner,
+			options.Repository,
+			options.Tag,
+		)
+		if inspectErr != nil {
+			return errors.Join(
+				fmt.Errorf("publish verified draft release: %w", err),
+				fmt.Errorf("inspect ambiguous publish result: %w", inspectErr),
+			)
+		}
+		if verifyErr := verifyPublishedRelease(
+			ctx,
+			runner,
+			options.Repository,
+			options,
+			published,
+			assets,
+			workspace,
+		); verifyErr != nil {
+			return errors.Join(
+				fmt.Errorf("publish verified draft release: %w", err),
+				fmt.Errorf("verify ambiguous published release: %w", verifyErr),
+			)
+		}
+		return nil
 	}
 	published, err := inspectRelease(ctx, runner, options.Repository, options.Tag)
 	if err != nil {
 		return fmt.Errorf("verify published release: %w", err)
 	}
-	if published.tag != options.Tag || published.targetCommit != options.Commit || published.draft {
-		return errors.New("published release state does not match the verified draft")
+	if err := verifyPublishedRelease(
+		ctx,
+		runner,
+		options.Repository,
+		options,
+		published,
+		assets,
+		workspace,
+	); err != nil {
+		return fmt.Errorf("verify published release: %w", err)
 	}
 	return nil
+}
+
+func verifyPublishedRelease(
+	ctx context.Context,
+	runner ghRunner,
+	repository string,
+	options publishOptions,
+	state releaseState,
+	assets []releaseAsset,
+	workspace string,
+) error {
+	if state.tag != options.Tag ||
+		state.targetCommit != options.Commit ||
+		state.draft {
+		return errors.New("published release state does not match the requested release")
+	}
+	return verifyCompleteRemoteAssets(
+		ctx,
+		runner,
+		repository,
+		options.Tag,
+		assets,
+		workspace,
+	)
 }
 
 func validatePublishOptions(options publishOptions) error {
