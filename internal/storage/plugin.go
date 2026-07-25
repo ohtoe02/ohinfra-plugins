@@ -9,14 +9,14 @@ import (
 	"slices"
 	"time"
 
-	pluginconfig "github.com/ohtoe02/ohinfra-plugins/internal/config"
-	"github.com/ohtoe02/ohinfra-plugins/internal/protocol"
+	pluginconfig "github.com/ohtoe02/ohtools-plugins/internal/config"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
 )
 
 const (
 	Name        = "storage-base"
-	Description = "Filesystem capacity and usage diagnostics for ohinfra."
-	ConfigPath  = "/etc/ohinfra/plugins/storage-base.yaml"
+	Description = "Filesystem capacity and usage diagnostics for ohtools."
+	ConfigPath  = "/etc/ohtools/plugins/storage-base.yaml"
 )
 
 type Config struct {

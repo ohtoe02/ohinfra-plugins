@@ -1,4 +1,4 @@
-module github.com/ohtoe02/ohinfra-plugins
+module github.com/ohtoe02/ohtools-plugins
 
 go 1.26.0
 

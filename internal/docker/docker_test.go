@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ohtoe02/ohinfra-plugins/internal/execx"
-	"github.com/ohtoe02/ohinfra-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/execx"
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
 )
 
 func TestManifestRegistersCompleteReadOnlyBaseline(t *testing.T) {
