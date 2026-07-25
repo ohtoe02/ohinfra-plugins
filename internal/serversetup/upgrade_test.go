@@ -51,10 +51,10 @@ func TestSystemBackendPlansAndAppliesOrdinaryUpgradeWithIsolatedIndexes(t *testi
 	if err := backend.ApplyUpgrade(context.Background(), profile, upgrades); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 3 {
+	if len(calls) != 5 {
 		t.Fatalf("calls = %#v", calls)
 	}
-	for _, call := range calls[:2] {
+	for _, call := range calls {
 		if call.Program != "apt-get" {
 			t.Fatalf("program = %q", call.Program)
 		}
@@ -62,17 +62,53 @@ func TestSystemBackendPlansAndAppliesOrdinaryUpgradeWithIsolatedIndexes(t *testi
 			t.Fatalf("apt call does not use isolated lists: %#v", call.Arguments)
 		}
 	}
-	if calls[2].Program != "apt-get" || !reflect.DeepEqual(
-		calls[2].Arguments,
-		[]string{
-			"install", "-y", "--only-upgrade", "--no-remove", "--",
-			"curl=7.88.2",
-		},
-	) {
-		t.Fatalf("exact upgrade argv = %#v", calls[2])
+	install := calls[4].Arguments
+	if !containsArgument(install, "install") ||
+		!containsArgument(install, "--only-upgrade") ||
+		!containsArgument(install, "--no-remove") ||
+		!containsArgument(install, "curl=7.88.2") {
+		t.Fatalf("exact upgrade argv = %#v", install)
 	}
 	if _, err := os.Stat(filepath.Join(root, "var", "cache", "ohtools", "server-setup", "apt")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("planner left persistent APT state: %v", err)
+	}
+}
+
+func TestSystemBackendRejectsChangedUpgradeCandidatesBeforeInstall(t *testing.T) {
+	t.Parallel()
+
+	simulations := 0
+	installs := 0
+	backend := SystemBackend{
+		Root: t.TempDir(),
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			if containsArgument(spec.Arguments, "--simulate") {
+				simulations++
+				if simulations == 1 {
+					return execx.Output{Stdout: []byte(
+						"Inst curl [7.88.1] (7.88.2 Debian:12/stable [amd64])\n",
+					)}, nil
+				}
+				return execx.Output{Stdout: []byte(
+					"Inst curl [7.88.1] (7.88.3 Debian:12/stable [amd64])\n",
+				)}, nil
+			}
+			if containsArgument(spec.Arguments, "install") {
+				installs++
+			}
+			return execx.Output{}, nil
+		}),
+	}
+	profile := Profile{Platform: Platform{ID: "debian", Version: "12"}, Config: DefaultConfig()}
+	approved, err := backend.PlanUpgrade(context.Background(), profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.ApplyUpgrade(context.Background(), profile, approved); err == nil {
+		t.Fatal("changed APT candidate set was installed")
+	}
+	if installs != 0 {
+		t.Fatalf("APT install ran after candidate drift: %d", installs)
 	}
 }
 

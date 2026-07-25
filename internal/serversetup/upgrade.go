@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -38,27 +39,9 @@ func (backend SystemBackend) PlanUpgrade(
 ) ([]PackageUpgrade, error) {
 	var upgrades []PackageUpgrade
 	err := backend.withIsolatedAPT(ctx, func(options []string) error {
-		environment := map[string]string{"DEBIAN_FRONTEND": "noninteractive"}
-		update := append([]string{"update"}, options...)
-		if _, err := backend.run(ctx, execx.Spec{
-			Program: "apt-get", Arguments: update, Environment: environment,
-		}); err != nil {
-			return err
-		}
-		simulate := []string{"--simulate", "upgrade", "--with-new-pkgs"}
-		simulate = append(simulate, options...)
-		output, err := backend.run(ctx, execx.Spec{
-			Program: "apt-get", Arguments: simulate, Environment: environment,
-		})
-		if err != nil {
-			return err
-		}
-		parsed, err := parsePackageUpgrades(output.Stdout)
-		if err != nil {
-			return err
-		}
-		upgrades = parsed
-		return nil
+		var err error
+		upgrades, err = backend.planUpgradeWithAPTOptions(ctx, options)
+		return err
 	})
 	return upgrades, err
 }
@@ -71,19 +54,54 @@ func (backend SystemBackend) ApplyUpgrade(
 	if len(upgrades) == 0 {
 		return nil
 	}
-	arguments := []string{"install", "-y", "--only-upgrade", "--no-remove", "--"}
 	for _, upgrade := range upgrades {
 		if !packageName.MatchString(upgrade.Name) || upgrade.CandidateVersion == "" ||
 			strings.ContainsAny(upgrade.CandidateVersion, "\x00\r\n\t ") {
 			return errors.New("approved package upgrade is invalid")
 		}
-		arguments = append(arguments, upgrade.Name+"="+upgrade.CandidateVersion)
 	}
-	_, err := backend.run(ctx, execx.Spec{
-		Program: "apt-get", Arguments: arguments,
-		Environment: map[string]string{"DEBIAN_FRONTEND": "noninteractive"},
+	return backend.withIsolatedAPT(ctx, func(options []string) error {
+		current, err := backend.planUpgradeWithAPTOptions(ctx, options)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(current, upgrades) {
+			return errors.New("approved package upgrade candidates changed")
+		}
+		arguments := []string{"install", "-y", "--only-upgrade", "--no-remove"}
+		arguments = append(arguments, options...)
+		arguments = append(arguments, "--")
+		for _, upgrade := range upgrades {
+			arguments = append(arguments, upgrade.Name+"="+upgrade.CandidateVersion)
+		}
+		_, err = backend.run(ctx, execx.Spec{
+			Program: "apt-get", Arguments: arguments,
+			Environment: map[string]string{"DEBIAN_FRONTEND": "noninteractive"},
+		})
+		return err
 	})
-	return err
+}
+
+func (backend SystemBackend) planUpgradeWithAPTOptions(
+	ctx context.Context,
+	options []string,
+) ([]PackageUpgrade, error) {
+	environment := map[string]string{"DEBIAN_FRONTEND": "noninteractive"}
+	update := append([]string{"update"}, options...)
+	if _, err := backend.run(ctx, execx.Spec{
+		Program: "apt-get", Arguments: update, Environment: environment,
+	}); err != nil {
+		return nil, err
+	}
+	simulate := []string{"--simulate", "upgrade", "--with-new-pkgs"}
+	simulate = append(simulate, options...)
+	output, err := backend.run(ctx, execx.Spec{
+		Program: "apt-get", Arguments: simulate, Environment: environment,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parsePackageUpgrades(output.Stdout)
 }
 
 func (backend SystemBackend) VerifyUpgrades(
@@ -147,8 +165,8 @@ func (backend SystemBackend) withIsolatedAPT(
 	}
 	defer func() {
 		cleanErr := os.RemoveAll(runDirectory)
-		if cleanErr != nil && returnErr == nil {
-			returnErr = cleanErr
+		if cleanErr != nil {
+			returnErr = errors.Join(returnErr, cleanErr)
 		}
 	}()
 	lists := filepath.Join(runDirectory, "lists")

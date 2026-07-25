@@ -216,6 +216,76 @@ func TestPlanDigestBindsHashedAuthorizedKeyMaterial(t *testing.T) {
 	}
 }
 
+func TestApplyUsesTheAuthorizedKeyBytesBoundToTheApprovedFingerprint(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	source := filepath.Join(root, "etc", "ohtools", "plugins", "keys", "operator.pub")
+	home := filepath.Join(root, "home", "operator")
+	for _, directory := range []string{filepath.Dir(source), home} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstKey := validEd25519PublicKeyWithSeed("approved@example", 1)
+	secondKey := validEd25519PublicKeyWithSeed("raced@example", 2)
+	if err := os.WriteFile(source, []byte(firstKey+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mutateOnID := false
+	mutated := false
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			switch {
+			case spec.Program == "id" && containsArgument(spec.Arguments, "-u"):
+				if mutateOnID && !mutated {
+					mutated = true
+					if err := os.WriteFile(source, []byte(secondKey+"\n"), 0o600); err != nil {
+						return execx.Output{}, err
+					}
+				}
+				return execx.Output{Stdout: []byte("1000\n")}, nil
+			case spec.Program == "getent":
+				return execx.Output{Stdout: []byte(
+					"operator:x:1000:1000:Operator:/home/operator:/bin/bash\n",
+				)}, nil
+			default:
+				return execx.Output{}, nil
+			}
+		}),
+	}
+	config := DefaultConfig()
+	config.Administrators = []Administrator{{
+		Name:                 "operator",
+		AuthorizedKeySources: []string{"/etc/ohtools/plugins/keys/operator.pub"},
+	}}
+	manager := Manager{
+		Backend: backend, Config: config,
+		Platform: Platform{ID: "debian", Version: "12"},
+	}
+	approved, err := manager.Plan(context.Background(), []string{"users"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved.Changes = approved.Changes[len(approved.Changes)-1:]
+	mutateOnID = true
+	result, err := manager.Apply(context.Background(), approved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != protocol.StatusPass {
+		t.Fatalf("apply result = %#v", result)
+	}
+	content, err := os.ReadFile(filepath.Join(home, ".ssh", "authorized_keys"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != firstKey+"\n" {
+		t.Fatalf("authorized_keys used bytes read after fingerprinting: %q", content)
+	}
+}
+
 func TestMutationRequiresExtendedSupportEntitlementBeforePlanningChanges(t *testing.T) {
 	t.Parallel()
 

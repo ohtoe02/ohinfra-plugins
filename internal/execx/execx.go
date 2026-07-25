@@ -103,6 +103,8 @@ type OSRunner struct {
 	Resolver Resolver
 }
 
+const processCleanupWait = time.Second
+
 func (runner OSRunner) Run(ctx context.Context, spec Spec) (Output, error) {
 	path, err := runner.Resolver.Resolve(spec.Program)
 	if err != nil {
@@ -118,6 +120,7 @@ func (runner OSRunner) Run(ctx context.Context, spec Spec) (Output, error) {
 	command.Stderr = stderr
 	command.Env = stableEnvironment(spec.Environment)
 	prepareCommand(command)
+	command.WaitDelay = processCleanupWait
 
 	started := time.Now()
 	if err := command.Start(); err != nil {
@@ -135,11 +138,38 @@ func (runner OSRunner) Run(ctx context.Context, spec Spec) (Output, error) {
 		}
 		return output, nil
 	case <-ctx.Done():
-		_ = killCommand(command)
-		<-done
-		output := buildOutput(path, command, stdout, stderr, time.Since(started))
-		output.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
-		return output, ctx.Err()
+		killErr := killCommand(command)
+		timer := time.NewTimer(processCleanupWait)
+		defer timer.Stop()
+		select {
+		case waitErr := <-done:
+			output := buildOutput(path, command, stdout, stderr, time.Since(started))
+			output.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+			var exitError *exec.ExitError
+			if waitErr != nil && !errors.As(waitErr, &exitError) {
+				waitErr = fmt.Errorf("cleanup wait for %s: %w", path, waitErr)
+			} else {
+				waitErr = nil
+			}
+			if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+				killErr = fmt.Errorf("cleanup kill %s: %w", path, killErr)
+			} else {
+				killErr = nil
+			}
+			return output, errors.Join(ctx.Err(), killErr, waitErr)
+		case <-timer.C:
+			output := Output{
+				Path:     path,
+				Duration: time.Since(started),
+				ExitCode: -1,
+				TimedOut: errors.Is(ctx.Err(), context.DeadlineExceeded),
+			}
+			return output, errors.Join(
+				ctx.Err(),
+				killErr,
+				fmt.Errorf("cleanup wait for %s exceeded %s", path, processCleanupWait),
+			)
+		}
 	}
 }
 

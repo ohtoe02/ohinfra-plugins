@@ -25,8 +25,11 @@ jobs:
           go test -race -timeout=5m ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
             -o server-setup-base_linux_amd64 ./cmd/server-setup-base
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -o server-setup-readiness_linux_amd64 ./tools/server-setup-readiness
           while IFS='|' read -r image expected_id expected_version; do
-            docker run --rm \
+            docker run --rm --network none --read-only \
+              --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
               --volume "$PWD:/work:ro" \
               --env EXPECTED_ID="$expected_id" \
               --env EXPECTED_VERSION="$expected_version" \
@@ -34,11 +37,16 @@ jobs:
                 . /etc/os-release
                 test "$ID" = "$EXPECTED_ID"
                 test "$VERSION_ID" = "$EXPECTED_VERSION"
-                printf "%s\n" \
-                  "{\"protocol_version\":1,\"request_id\":\"release-readiness\",\"command_path\":[\"setup\",\"check\"],\"arguments\":[],\"options\":{}}" |
-                  /work/server-setup-base_linux_amd64 execute --protocol=1 >/tmp/result.json
-                grep -q "\"schema_version\":\"1.0\"" /tmp/result.json
+                /work/server-setup-base_linux_amd64 manifest --protocol=1 >/tmp/manifest.json
+                grep -q "\"name\":\"server-setup-base\"" /tmp/manifest.json
               '
+            report="server-setup-readiness-${expected_id}-${expected_version}.json"
+            docker run --rm --network none --read-only \
+              --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+              --volume "$PWD:/work:ro" \
+              "$image" /work/server-setup-readiness_linux_amd64 > "$report"
+            ./server-setup-readiness_linux_amd64 verify-report \
+              "$report" "$expected_id" "$expected_version"
           done <<'EOF'
           debian:10-slim|debian|10
           debian:11-slim|debian|11

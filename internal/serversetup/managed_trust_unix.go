@@ -15,10 +15,10 @@ func validateManagedPath(
 	directory bool,
 	allowCurrentOwner bool,
 ) error {
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("managed path %s has unavailable ownership metadata", path)
+	if err := validateManagedOwner(path, info, allowCurrentOwner); err != nil {
+		return err
 	}
+	stat := info.Sys().(*syscall.Stat_t)
 	if err := validateManagedMetadata(
 		stat.Uid,
 		info.Mode(),
@@ -26,6 +26,22 @@ func validateManagedPath(
 		allowCurrentOwner,
 	); err != nil {
 		return fmt.Errorf("managed path %s is unsafe: %w", path, err)
+	}
+	return nil
+}
+
+func validateManagedOwner(
+	path string,
+	info os.FileInfo,
+	allowCurrentOwner bool,
+) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("managed path %s has unavailable ownership metadata", path)
+	}
+	if stat.Uid != 0 &&
+		(!allowCurrentOwner || stat.Uid != uint32(os.Geteuid())) {
+		return fmt.Errorf("managed path %s has an untrusted owner", path)
 	}
 	return nil
 }

@@ -109,14 +109,20 @@ nftables configuration.
 The supported OS matrix is Debian 10–13 and Ubuntu 20.04, 22.04, and 24.04 LTS.
 Debian 10 requires an active Freexian ELTS source; Ubuntu 20.04 requires an
 attached Ubuntu Pro/ESM entitlement before a mutation is planned. `setup
-upgrade` plans with a fully removed temporary APT-index workspace and installs
-only the exact package versions in the confirmed plan. It never runs
-`dist-upgrade`, `autoremove`, or reboot.
+upgrade` plans with a temporary isolated APT-index workspace. Immediately
+before applying, it creates a fresh workspace, refreshes and recomputes the
+candidate set, and requires an exact match with the confirmed plan. The exact
+package versions are then installed with the same isolated lists and archives
+options. It never touches the system APT lists and never runs `dist-upgrade`,
+`autoremove`, or reboot.
 
-Managed-file transactions fail closed when a previous crash leaves a
-`.stage`, `.rollback`, `.ohtools-include.stage`, or
-`.ohtools-include.rollback` artifact. Before retrying, an administrator must
-inspect the target and artifact, restore the known-good file when necessary,
-validate the affected subsystem with its native tool, and only then remove the
-stale artifact. The plugin never guesses which side of an interrupted rename
-is authoritative.
+Managed-file activations use a durable schema-v1 phase journal and fsync each
+critical file and parent-directory transition. A later `setup apply`
+automatically resumes verified cleanup or restores the trusted rollback copy
+before retrying. SSH vendor-file include insertion uses the same deterministic
+stage/rollback recovery rules. Unsafe, malformed, untrusted, or incomplete
+recovery artifacts still fail closed and require administrator inspection;
+serialized paths are never accepted as filesystem instructions.
+Rollback reactivation and firewall restoration use their own bounded cleanup
+deadline, so cancellation of the initiating operation cannot silently skip
+restoring the previously active state.

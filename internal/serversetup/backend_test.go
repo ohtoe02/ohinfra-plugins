@@ -1,6 +1,7 @@
 package serversetup
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -27,6 +28,9 @@ func TestSystemBackendStagesActivatesAndVerifiesOwnedFile(t *testing.T) {
 		Root: root,
 		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
 			calls = append(calls, spec)
+			if spec.Program == "sysctl" && containsArgument(spec.Arguments, "-n") {
+				return execx.Output{Stdout: []byte("2\n1\n1\n1\n")}, nil
+			}
 			return execx.Output{}, nil
 		}),
 	}
@@ -55,9 +59,75 @@ func TestSystemBackendStagesActivatesAndVerifiesOwnedFile(t *testing.T) {
 	if !strings.Contains(string(content), "kernel.kptr_restrict = 2") {
 		t.Fatalf("managed content = %q", content)
 	}
-	if len(calls) != 1 || calls[0].Program != "sysctl" ||
+	if len(calls) != 3 || calls[0].Program != "sysctl" ||
 		!reflect.DeepEqual(calls[0].Arguments, []string{"--system"}) {
 		t.Fatalf("runner calls = %#v", calls)
+	}
+}
+
+func TestManagedItemsRequirePersistentAndEffectiveConvergence(t *testing.T) {
+	t.Parallel()
+
+	for _, item := range []Item{
+		ItemCronPermissions,
+		ItemFail2Ban,
+		ItemTimeSync,
+		ItemLogging,
+		ItemAuditd,
+		ItemSysctl,
+		ItemZabbix,
+	} {
+		item := item
+		t.Run(string(item), func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			backend := SystemBackend{
+				Root: root,
+				Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+					if spec.Program == "sysctl" {
+						return execx.Output{Stdout: []byte("0\n0\n0\n0\n")}, nil
+					}
+					return execx.Output{ExitCode: 1}, nil
+				}),
+			}
+			config := DefaultConfig()
+			config.Zabbix = &ZabbixConfig{
+				Enabled: true, Server: "127.0.0.1", Hostname: "fixture",
+			}
+			profile := Profile{
+				Platform: Platform{ID: "debian", Version: "12"},
+				Config:   config,
+				Items:    []Item{ItemPackages, item},
+			}
+			managed, err := backend.desiredFile(item, profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := backend.path(managed.Path)
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, managed.Content, managed.Mode); err != nil {
+				t.Fatal(err)
+			}
+			if item == ItemCronPermissions {
+				unsafe := filepath.Join(root, "etc", "cron.d", "foreign")
+				if err := os.WriteFile(unsafe, []byte("* * * * * root true\n"), 0o666); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(unsafe, 0o666); err != nil {
+					t.Fatal(err)
+				}
+			}
+			observation, err := backend.Observe(context.Background(), item, profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if observation.Converged {
+				t.Fatal("persistent file hid effective-state drift")
+			}
+		})
 	}
 }
 
@@ -107,12 +177,16 @@ func TestSystemBackendRollsBackWhenPostVerificationFails(t *testing.T) {
 	if err := os.WriteFile(target, previous, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	activationCalls := 0
 	backend := SystemBackend{
 		Root: root,
 		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
 			if spec.Program == "sysctl" {
-				if err := os.WriteFile(target, []byte("# rejected effective state\n"), 0o644); err != nil {
-					return execx.Output{}, err
+				activationCalls++
+				if activationCalls == 1 {
+					if err := os.WriteFile(target, []byte("# rejected effective state\n"), 0o644); err != nil {
+						return execx.Output{}, err
+					}
 				}
 			}
 			return execx.Output{}, nil
@@ -132,6 +206,62 @@ func TestSystemBackendRollsBackWhenPostVerificationFails(t *testing.T) {
 	}
 	if !reflect.DeepEqual(content, previous) {
 		t.Fatalf("post-verification rollback content = %q", content)
+	}
+	if activationCalls != 2 {
+		t.Fatalf("activation calls = %d, want apply and rollback reactivation", activationCalls)
+	}
+}
+
+func TestManagedActivationRollbackUsesIndependentBoundedContext(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	target := filepath.Join(root, "etc", "sysctl.d", "60-ohtools-server-setup.conf")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previous := []byte("# previous\n")
+	if err := os.WriteFile(target, previous, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	activationCalls := 0
+	cleanupSawCanceledContext := false
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(runContext context.Context, spec execx.Spec) (execx.Output, error) {
+			if spec.Program != "sysctl" || !containsArgument(spec.Arguments, "--system") {
+				return execx.Output{}, errors.New("unexpected command")
+			}
+			activationCalls++
+			if activationCalls == 1 {
+				cancel()
+				return execx.Output{}, context.Canceled
+			}
+			cleanupSawCanceledContext = runContext.Err() != nil
+			return execx.Output{}, nil
+		}),
+	}
+	err := backend.Apply(ctx, ItemSysctl, Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   DefaultConfig(),
+		Items:    []Item{ItemPackages, ItemSysctl},
+	})
+	if err == nil {
+		t.Fatal("canceled activation was accepted")
+	}
+	if activationCalls != 2 {
+		t.Fatalf("activation calls = %d, want failed apply and rollback reactivation", activationCalls)
+	}
+	if cleanupSawCanceledContext {
+		t.Fatal("rollback activation inherited the canceled operation context")
+	}
+	content, readErr := os.ReadFile(target)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(content, previous) {
+		t.Fatalf("rollback content = %q", content)
 	}
 }
 
@@ -163,6 +293,181 @@ func TestSystemBackendFailsClosedOnStaleManagedTransactionArtifact(t *testing.T)
 	})
 	if err == nil {
 		t.Fatal("stale managed transaction artifact was ignored")
+	}
+}
+
+func TestSystemBackendRecoversInterruptedManagedTransactionsBeforeRetry(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		phase     string
+		hadTarget bool
+		target    bool
+		stage     bool
+		rollback  bool
+	}{
+		{name: "staged", phase: "staged", hadTarget: true, target: true, stage: true},
+		{name: "backup rename", phase: "backed_up", hadTarget: true, stage: true, rollback: true},
+		{name: "activated", phase: "activated", hadTarget: true, target: true, rollback: true},
+		{name: "postverify", phase: "verified", hadTarget: true, target: true, rollback: true},
+		{name: "new target activated", phase: "activated", target: true},
+		{name: "rollback before restore", phase: "rolling_back", hadTarget: true, target: true, rollback: true},
+		{name: "rollback after restore", phase: "rolling_back", hadTarget: true, target: true},
+		{name: "new target rolling back", phase: "rolling_back", target: true},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			backend := SystemBackend{Root: root, Runner: successfulRunner()}
+			profile := Profile{
+				Platform: Platform{ID: "debian", Version: "12"},
+				Config:   DefaultConfig(),
+				Items:    []Item{ItemPackages, ItemSysctl},
+			}
+			managed, err := backend.desiredFile(ItemSysctl, profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := backend.path(managed.Path)
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if test.target {
+				if err := os.WriteFile(target, []byte("# interrupted target\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.stage {
+				if err := os.WriteFile(target+".stage", managed.Content, managed.Mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.rollback {
+				if err := os.WriteFile(target+".rollback", []byte("# previous\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			journal := fmt.Sprintf(
+				"{\"schema_version\":\"1\",\"phase\":%q,\"had_target\":%t}\n",
+				test.phase,
+				test.hadTarget,
+			)
+			if err := os.WriteFile(
+				target+".transaction-v1.json",
+				[]byte(journal),
+				0o600,
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := backend.Apply(context.Background(), ItemSysctl, profile); err != nil {
+				t.Fatal(err)
+			}
+			content, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(content, managed.Content) {
+				t.Fatalf("recovered content = %q", content)
+			}
+			for _, suffix := range []string{
+				".stage", ".rollback", ".transaction-v1.json",
+			} {
+				if _, err := os.Lstat(target + suffix); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("recovery left %s: %v", suffix, err)
+				}
+			}
+		})
+	}
+}
+
+func TestManagedRecoveryRemovesUnverifiedNewTargetBeforeActivatedPhase(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	backend := SystemBackend{Root: root}
+	target := filepath.Join(root, "etc", "sysctl.d", "60-ohtools-server-setup.conf")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("# unverified\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		target+".transaction-v1.json",
+		[]byte("{\"schema_version\":\"1\",\"phase\":\"staged\",\"had_target\":false}\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := backend.recoverManagedTransaction(target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unverified target survived recovery: %v", err)
+	}
+}
+
+func TestManagedRecoveryReactivatesAfterRollingBackEscapedEffectiveState(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	backend := SystemBackend{}
+	profile := Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   DefaultConfig(),
+		Items:    []Item{ItemPackages, ItemSysctl},
+	}
+	managed, err := backend.desiredFile(ItemSysctl, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.Root = root
+	target := backend.path(managed.Path)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, managed.Content, managed.Mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target+".rollback", []byte("# previous\n"), managed.Mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		target+".transaction-v1.json",
+		[]byte("{\"schema_version\":\"1\",\"phase\":\"activated\",\"had_target\":true}\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	activationCalls := 0
+	effective := false
+	backend.Runner = execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+		switch {
+		case spec.Program == "sysctl" && containsArgument(spec.Arguments, "--system"):
+			activationCalls++
+			effective = true
+			return execx.Output{}, nil
+		case spec.Program == "sysctl" && containsArgument(spec.Arguments, "-n"):
+			if effective {
+				return execx.Output{Stdout: []byte("2\n1\n1\n1\n")}, nil
+			}
+			return execx.Output{Stdout: []byte("0\n0\n0\n0\n")}, nil
+		default:
+			return execx.Output{}, errors.New("unexpected command")
+		}
+	})
+
+	if err := backend.Apply(context.Background(), ItemSysctl, profile); err != nil {
+		t.Fatal(err)
+	}
+	if activationCalls != 1 {
+		t.Fatalf("activation calls = %d, want recovered config reactivation", activationCalls)
 	}
 }
 
@@ -649,6 +954,9 @@ func TestSystemBackendRejectsAdministratorWithMissingHomeDirectory(t *testing.T)
 	if err == nil {
 		t.Fatal("administrator with a missing home directory was accepted")
 	}
+	if _, statErr := os.Lstat(filepath.Join(root, "home")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("read-only administrator observation created a home parent: %v", statErr)
+	}
 }
 
 func TestFirewallObservationRejectsWrongActivePort(t *testing.T) {
@@ -696,6 +1004,49 @@ func TestFirewallObservationRejectsWrongActivePort(t *testing.T) {
 	}
 }
 
+func TestFirewallObservationRejectsInactiveManagedUnit(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	config := DefaultConfig()
+	config.ManageFirewall = true
+	profile := Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemFirewall},
+	}
+	backend := SystemBackend{Root: root}
+	rules := mustFirewallFiles(t, backend, profile)[0].Content
+	backend.Runner = execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+		switch {
+		case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-enabled"):
+			return execx.Output{}, nil
+		case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-active"):
+			return execx.Output{ExitCode: 3}, nil
+		case spec.Program == "nft":
+			return execx.Output{Stdout: rules}, nil
+		default:
+			return execx.Output{}, nil
+		}
+	})
+	for _, managed := range mustFirewallFiles(t, backend, profile) {
+		target := backend.path(managed.Path)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, managed.Content, managed.Mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	observation, err := backend.Observe(context.Background(), ItemFirewall, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Converged {
+		t.Fatal("inactive firewall unit was accepted as converged")
+	}
+}
+
 func TestFirewallRollbackRestoresActiveRulesAndEnablement(t *testing.T) {
 	t.Parallel()
 
@@ -708,6 +1059,7 @@ func TestFirewallRollbackRestoresActiveRulesAndEnablement(t *testing.T) {
 		Items:    []Item{ItemPackages, ItemFirewall},
 	}
 	enabled := false
+	unitActive := true
 	activeRules := append([]byte(nil), mustFirewallFiles(
 		t,
 		SystemBackend{Root: root},
@@ -722,6 +1074,11 @@ func TestFirewallRollbackRestoresActiveRulesAndEnablement(t *testing.T) {
 					return execx.Output{}, nil
 				}
 				return execx.Output{ExitCode: 1}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-active"):
+				if unitActive {
+					return execx.Output{}, nil
+				}
+				return execx.Output{ExitCode: 3}, nil
 			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "enable"):
 				enabled = true
 				return execx.Output{}, nil
@@ -730,7 +1087,14 @@ func TestFirewallRollbackRestoresActiveRulesAndEnablement(t *testing.T) {
 				return execx.Output{}, nil
 			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "restart"):
 				activeRules = nil
+				unitActive = false
 				return execx.Output{ExitCode: 1, Stderr: []byte("restart failed")}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "start"):
+				unitActive = true
+				return execx.Output{}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "stop"):
+				unitActive = false
+				return execx.Output{}, nil
 			case spec.Program == "systemctl":
 				return execx.Output{}, nil
 			case spec.Program == "nft" && containsArgument(spec.Arguments, "list"):
@@ -776,8 +1140,82 @@ func TestFirewallRollbackRestoresActiveRulesAndEnablement(t *testing.T) {
 	if enabled {
 		t.Fatal("firewall service enablement was not rolled back")
 	}
+	if !unitActive {
+		t.Fatal("firewall service active state was not rolled back")
+	}
 	if !firewallRulesEqual(activeRules, mustFirewallFiles(t, backend, oldProfile)[0].Content) {
 		t.Fatalf("active firewall rules were not restored: %q", activeRules)
+	}
+}
+
+func TestFirewallRollbackUsesIndependentBoundedContext(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	config := DefaultConfig()
+	config.ManageFirewall = true
+	oldProfile := Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemFirewall},
+	}
+	backend := SystemBackend{Root: root}
+	oldRules := append([]byte(nil), mustFirewallFiles(t, backend, oldProfile)[0].Content...)
+	for _, managed := range mustFirewallFiles(t, backend, oldProfile) {
+		target := backend.path(managed.Path)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, managed.Content, managed.Mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	rollbackCalls := 0
+	cleanupSawCanceledContext := false
+	backend.Runner = execx.RunnerFunc(func(runContext context.Context, spec execx.Spec) (execx.Output, error) {
+		switch {
+		case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-enabled"):
+			return execx.Output{ExitCode: 1}, nil
+		case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-active"):
+			return execx.Output{}, nil
+		case spec.Program == "systemctl" && containsArgument(spec.Arguments, "enable"):
+			return execx.Output{}, nil
+		case spec.Program == "systemctl" && containsArgument(spec.Arguments, "restart"):
+			cancel()
+			return execx.Output{}, context.Canceled
+		case spec.Program == "systemctl" &&
+			(containsArgument(spec.Arguments, "disable") ||
+				containsArgument(spec.Arguments, "start")):
+			rollbackCalls++
+			cleanupSawCanceledContext = cleanupSawCanceledContext || runContext.Err() != nil
+			return execx.Output{}, nil
+		case spec.Program == "systemctl":
+			return execx.Output{}, nil
+		case spec.Program == "nft" && containsArgument(spec.Arguments, "list"):
+			return execx.Output{Stdout: append([]byte(nil), oldRules...)}, nil
+		case spec.Program == "nft" && containsArgument(spec.Arguments, "-c"):
+			return execx.Output{}, nil
+		case spec.Program == "nft" &&
+			(containsArgument(spec.Arguments, "delete") ||
+				containsArgument(spec.Arguments, "-f")):
+			rollbackCalls++
+			cleanupSawCanceledContext = cleanupSawCanceledContext || runContext.Err() != nil
+			return execx.Output{}, nil
+		default:
+			return execx.Output{}, nil
+		}
+	})
+	newProfile := oldProfile
+	newProfile.Config.SSHPort = 2222
+	if err := backend.Apply(ctx, ItemFirewall, newProfile); err == nil {
+		t.Fatal("canceled firewall restart was accepted")
+	}
+	if rollbackCalls != 4 {
+		t.Fatalf("rollback calls = %d, want disable, start, delete, and restore", rollbackCalls)
+	}
+	if cleanupSawCanceledContext {
+		t.Fatal("firewall rollback inherited the canceled operation context")
 	}
 }
 
@@ -951,6 +1389,60 @@ func TestSystemBackendAddsEarlySSHIncludeAndVerifiesEffectiveState(t *testing.T)
 	}
 	if len(calls) < 3 {
 		t.Fatalf("expected syntax, reload, and effective-state checks; calls=%#v", calls)
+	}
+}
+
+func TestSSHIncludeRecoversInterruptedActivationBeforeRetry(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	target := filepath.Join(root, "etc", "ssh", "sshd_config")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		target,
+		[]byte(sshIncludeDirective+"\n# interrupted\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		target+".ohtools-include.rollback",
+		[]byte("# previous\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		target+".ohtools-include.stage",
+		[]byte(sshIncludeDirective+"\n# staged\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	backend := SystemBackend{Root: root, Runner: successfulRunner()}
+	change, err := backend.beginSSHInclude(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := change.commit(); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(content), sshIncludeDirective+"\n") {
+		t.Fatalf("recovered SSH include content = %q", content)
+	}
+	for _, suffix := range []string{
+		".ohtools-include.stage",
+		".ohtools-include.rollback",
+	} {
+		if _, err := os.Lstat(target + suffix); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("SSH recovery left %s: %v", suffix, err)
+		}
 	}
 }
 
@@ -1132,6 +1624,7 @@ func TestSystemBackendPersistsFirewallWithoutSecondUpdate(t *testing.T) {
 	root := t.TempDir()
 	enabled := false
 	active := false
+	unitActive := false
 	daemonReloads := 0
 	enableCalls := 0
 	restartCalls := 0
@@ -1153,6 +1646,11 @@ func TestSystemBackendPersistsFirewallWithoutSecondUpdate(t *testing.T) {
 					return execx.Output{}, nil
 				}
 				return execx.Output{ExitCode: 1}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-active"):
+				if unitActive {
+					return execx.Output{}, nil
+				}
+				return execx.Output{ExitCode: 3}, nil
 			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "daemon-reload"):
 				daemonReloads++
 				return execx.Output{}, nil
@@ -1163,6 +1661,7 @@ func TestSystemBackendPersistsFirewallWithoutSecondUpdate(t *testing.T) {
 			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "restart"):
 				restartCalls++
 				active = true
+				unitActive = true
 				return execx.Output{}, nil
 			default:
 				return execx.Output{}, errors.New("unexpected command")
@@ -1223,7 +1722,16 @@ func TestSystemBackendPersistsFirewallWithoutSecondUpdate(t *testing.T) {
 }
 
 func successfulRunner() execx.Runner {
-	return execx.RunnerFunc(func(context.Context, execx.Spec) (execx.Output, error) {
+	return execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+		if spec.Program == "sysctl" && containsArgument(spec.Arguments, "-n") {
+			return execx.Output{Stdout: []byte("2\n1\n1\n1\n")}, nil
+		}
+		if spec.Program == "timedatectl" {
+			return execx.Output{Stdout: []byte("yes\n")}, nil
+		}
+		if spec.Program == "zabbix_agent2" {
+			return execx.Output{Stdout: []byte("agent.ping [t|1]\n")}, nil
+		}
 		return execx.Output{}, nil
 	})
 }

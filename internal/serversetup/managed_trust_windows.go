@@ -13,6 +13,10 @@ func validateManagedPath(
 	return nil
 }
 
+func validateManagedOwner(string, os.FileInfo, bool) error {
+	return nil
+}
+
 func validateAdministratorPath(
 	string,
 	os.FileInfo,

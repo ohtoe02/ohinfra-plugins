@@ -103,9 +103,12 @@ jobs:
           go-version: "1.26.0"
           cache: true
       - name: Build static server setup binary
-        run: >-
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath
-          -o server-setup-base_linux_amd64 ./cmd/server-setup-base
+        shell: bash
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -o server-setup-base_linux_amd64 ./cmd/server-setup-base
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -o server-setup-readiness_linux_amd64 ./tools/server-setup-readiness
       - name: Run plugin inside declared OS image
         shell: bash
         env:
@@ -113,7 +116,8 @@ jobs:
           EXPECTED_ID: ${{ matrix.id }}
           EXPECTED_VERSION: ${{ matrix.version }}
         run: |
-          docker run --rm \
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
             --volume "$PWD:/work:ro" \
             --env EXPECTED_ID \
             --env EXPECTED_VERSION \
@@ -123,11 +127,15 @@ jobs:
               test "$VERSION_ID" = "$EXPECTED_VERSION"
               /work/server-setup-base_linux_amd64 manifest --protocol=1 >/tmp/manifest.json
               grep -q "\"name\":\"server-setup-base\"" /tmp/manifest.json
-              printf "%s\n" \
-                "{\"protocol_version\":1,\"request_id\":\"os-matrix\",\"command_path\":[\"setup\",\"check\"],\"arguments\":[],\"options\":{}}" |
-                /work/server-setup-base_linux_amd64 execute --protocol=1 >/tmp/result.json
-              grep -q "\"schema_version\":\"1.0\"" /tmp/result.json
             '
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+            --volume "$PWD:/work:ro" \
+            "$IMAGE" /work/server-setup-readiness_linux_amd64 \
+            > server-setup-readiness-report.json
+          ./server-setup-readiness_linux_amd64 verify-report \
+            server-setup-readiness-report.json \
+            "$EXPECTED_ID" "$EXPECTED_VERSION"
 
   server-setup-readiness:
     needs: server-setup-os-matrix
@@ -145,6 +153,8 @@ jobs:
           go test -race -timeout=5m ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
             -o server-setup-base_linux_amd64 ./cmd/server-setup-base
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -o server-setup-readiness_linux_amd64 ./tools/server-setup-readiness
           file server-setup-base_linux_amd64 | grep -q "statically linked"
           ./server-setup-base_linux_amd64 manifest --protocol=1 \
             > server-setup-base_manifest-v1.json

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/ohtoe02/ohtools-plugins/internal/execx"
+	"github.com/ohtoe02/ohtools-plugins/internal/strictjson"
 )
 
 type SystemBackend struct {
@@ -45,6 +46,14 @@ type managedFile struct {
 	Validate   *execx.Spec
 	Activation *execx.Spec
 }
+
+type managedTransactionJournal struct {
+	SchemaVersion string `json:"schema_version"`
+	Phase         string `json:"phase"`
+	HadTarget     bool   `json:"had_target"`
+}
+
+const rollbackCommandTimeout = 10 * time.Second
 
 func (backend SystemBackend) Entitled(ctx context.Context, platform Platform) error {
 	if !platform.RequiresExtendedSupport {
@@ -104,10 +113,18 @@ func (backend SystemBackend) Observe(
 		if managed == nil {
 			return Observation{Converged: true, Summary: string(item) + " is disabled"}, nil
 		}
-		converged, err := backend.fileConverged(*managed)
+		persistent, err := backend.fileConverged(*managed)
 		if err != nil {
 			return Observation{}, err
 		}
+		effective := false
+		if persistent {
+			effective, err = backend.effectiveStateConverged(ctx, item, profile)
+			if err != nil {
+				return Observation{}, err
+			}
+		}
+		converged := persistent && effective
 		summary := string(item) + " configuration differs from the desired state"
 		if converged {
 			summary = string(item) + " configuration matches the desired state"
@@ -116,11 +133,12 @@ func (backend SystemBackend) Observe(
 	}
 }
 
-func (backend SystemBackend) DesiredStateMaterial(
+func (backend SystemBackend) PrepareDesiredState(
 	_ context.Context,
-	profile Profile,
+	profile *Profile,
 ) (map[string]string, error) {
 	material := make(map[string]string)
+	profile.DesiredAuthorizedKeys = make(map[string][]string)
 	if !slices.Contains(profile.Items, ItemUsers) {
 		return material, nil
 	}
@@ -132,6 +150,8 @@ func (backend SystemBackend) DesiredStateMaterial(
 		if err != nil {
 			return nil, err
 		}
+		profile.DesiredAuthorizedKeys[administrator.Name] =
+			append([]string(nil), keys...)
 		encoded, err := json.Marshal(keys)
 		if err != nil {
 			return nil, err
@@ -165,21 +185,222 @@ func (backend SystemBackend) Apply(
 		if managed == nil {
 			return nil
 		}
-		return backend.activateManagedFileWithPostVerify(
+		if err := backend.recoverManagedTransaction(
+			backend.path(managed.Path),
+		); err != nil {
+			return err
+		}
+		persistent, err := backend.fileConverged(*managed)
+		if err != nil {
+			return err
+		}
+		effective := false
+		if persistent {
+			effective, err = backend.effectiveStateConverged(ctx, item, profile)
+			if err != nil {
+				return err
+			}
+		}
+		if persistent && effective {
+			return nil
+		}
+		verify := func() error {
+			if item == ItemCronPermissions {
+				if err := backend.repairCronPermissions(); err != nil {
+					return err
+				}
+			}
+			converged, verifyErr := backend.managedFileContentConverged(*managed)
+			if verifyErr != nil {
+				return verifyErr
+			}
+			if !converged {
+				return fmt.Errorf("%s persistent state did not converge", item)
+			}
+			converged, verifyErr = backend.effectiveStateConverged(ctx, item, profile)
+			if verifyErr != nil {
+				return verifyErr
+			}
+			if !converged {
+				return fmt.Errorf("%s effective state did not converge", item)
+			}
+			return nil
+		}
+		if !persistent {
+			return backend.activateManagedFileWithPostVerify(ctx, *managed, verify)
+		}
+		if item == ItemCronPermissions {
+			return verify()
+		}
+		if managed.Activation == nil {
+			return fmt.Errorf("%s has no effective-state activation", item)
+		}
+		if _, err := backend.run(
 			ctx,
-			*managed,
-			func() error {
-				converged, verifyErr := backend.managedFileContentConverged(*managed)
-				if verifyErr != nil {
-					return verifyErr
-				}
-				if !converged {
-					return fmt.Errorf("%s did not converge", item)
-				}
-				return nil
-			},
-		)
+			expandManagedSpec(*managed.Activation, "", backend.path(managed.Path)),
+		); err != nil {
+			return err
+		}
+		return verify()
 	}
+}
+
+func (backend SystemBackend) effectiveStateConverged(
+	ctx context.Context,
+	item Item,
+	_ Profile,
+) (bool, error) {
+	switch item {
+	case ItemCronPermissions:
+		return backend.cronPermissionsConverged()
+	case ItemFail2Ban:
+		active, err := backend.commandConverged(ctx, execx.Spec{
+			Program: "systemctl", Arguments: []string{"is-active", "--", "fail2ban.service"},
+		})
+		if err != nil || !active {
+			return active, err
+		}
+		return backend.commandConverged(ctx, execx.Spec{
+			Program: "fail2ban-client", Arguments: []string{"status", "sshd"},
+		})
+	case ItemTimeSync:
+		active, err := backend.commandConverged(ctx, execx.Spec{
+			Program:   "systemctl",
+			Arguments: []string{"is-active", "--", "systemd-timesyncd.service"},
+		})
+		if err != nil || !active {
+			return active, err
+		}
+		output, err := backend.runRaw(ctx, execx.Spec{
+			Program:   "timedatectl",
+			Arguments: []string{"show", "--property=NTPSynchronized", "--value"},
+		})
+		return err == nil && output.ExitCode == 0 &&
+			strings.EqualFold(strings.TrimSpace(string(output.Stdout)), "yes"), err
+	case ItemLogging:
+		return backend.commandConverged(ctx, execx.Spec{
+			Program:   "systemctl",
+			Arguments: []string{"is-active", "--", "systemd-journald.service"},
+		})
+	case ItemAuditd:
+		active, err := backend.commandConverged(ctx, execx.Spec{
+			Program: "systemctl", Arguments: []string{"is-active", "--", "auditd.service"},
+		})
+		if err != nil || !active {
+			return active, err
+		}
+		return backend.commandConverged(ctx, execx.Spec{
+			Program: "augenrules", Arguments: []string{"--check"},
+		})
+	case ItemSysctl:
+		output, err := backend.runRaw(ctx, execx.Spec{
+			Program: "sysctl",
+			Arguments: []string{
+				"-n",
+				"kernel.kptr_restrict",
+				"kernel.dmesg_restrict",
+				"fs.protected_hardlinks",
+				"fs.protected_symlinks",
+			},
+		})
+		if err != nil || output.ExitCode != 0 {
+			return false, err
+		}
+		return strings.Fields(string(output.Stdout)) != nil &&
+			slices.Equal(
+				strings.Fields(string(output.Stdout)),
+				[]string{"2", "1", "1", "1"},
+			), nil
+	case ItemZabbix:
+		active, err := backend.commandConverged(ctx, execx.Spec{
+			Program:   "systemctl",
+			Arguments: []string{"is-active", "--", "zabbix-agent2.service"},
+		})
+		if err != nil || !active {
+			return active, err
+		}
+		output, err := backend.runRaw(ctx, execx.Spec{
+			Program: "zabbix_agent2", Arguments: []string{"-t", "agent.ping"},
+		})
+		return err == nil && output.ExitCode == 0 &&
+			strings.Contains(string(output.Stdout), "[t|1]"), err
+	default:
+		return true, nil
+	}
+}
+
+func (backend SystemBackend) commandConverged(
+	ctx context.Context,
+	spec execx.Spec,
+) (bool, error) {
+	output, err := backend.runRaw(ctx, spec)
+	if err != nil {
+		return false, err
+	}
+	return output.ExitCode == 0, nil
+}
+
+func (backend SystemBackend) cronPermissionsConverged() (bool, error) {
+	directory := backend.path("/etc/cron.d")
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		path := filepath.Join(directory, entry.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return false, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return false, fmt.Errorf("cron path %s is unsafe", path)
+		}
+		if err := validateManagedOwner(
+			path,
+			info,
+			backend.Root != "",
+		); err != nil {
+			return false, err
+		}
+		if info.Mode().Perm()&0o022 != 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (backend SystemBackend) repairCronPermissions() error {
+	directory := backend.path("/etc/cron.d")
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		path := filepath.Join(directory, entry.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("cron path %s is unsafe", path)
+		}
+		if err := validateManagedOwner(
+			path,
+			info,
+			backend.Root != "",
+		); err != nil {
+			return err
+		}
+		if info.Mode().Perm()&0o022 != 0 {
+			if err := os.Chmod(path, info.Mode().Perm()&^0o022); err != nil {
+				return err
+			}
+		}
+	}
+	return syncDirectory(directory)
 }
 
 const sshIncludeDirective = "Include /etc/ssh/sshd_config.d/*.conf"
@@ -199,7 +420,8 @@ type fileSnapshot struct {
 
 type firewallState struct {
 	enabled     bool
-	active      bool
+	unitActive  bool
+	rulesActive bool
 	activeRules []byte
 }
 
@@ -235,8 +457,7 @@ func (backend SystemBackend) applySSH(
 		}
 		return errors.Join(
 			err,
-			restoreFileSnapshot(snapshot),
-			include.rollback(),
+			backend.rollbackSSH(ctx, snapshot, include, false),
 		)
 	}
 	if _, err := backend.run(ctx, execx.Spec{
@@ -244,11 +465,31 @@ func (backend SystemBackend) applySSH(
 	}); err != nil {
 		return errors.Join(
 			err,
-			restoreFileSnapshot(snapshot),
-			include.rollback(),
+			backend.rollbackSSH(ctx, snapshot, include, true),
 		)
 	}
 	return include.commit()
+}
+
+func (backend SystemBackend) rollbackSSH(
+	ctx context.Context,
+	snapshot fileSnapshot,
+	include sshIncludeChange,
+	reactivate bool,
+) error {
+	restoreErr := errors.Join(restoreFileSnapshot(snapshot), include.rollback())
+	if restoreErr != nil || !reactivate {
+		return restoreErr
+	}
+	cleanupContext, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		rollbackCommandTimeout,
+	)
+	defer cancel()
+	_, reloadErr := backend.run(cleanupContext, execx.Spec{
+		Program: "systemctl", Arguments: []string{"reload", "ssh.service"},
+	})
+	return reloadErr
 }
 
 func (backend SystemBackend) ensureSSHAdministratorAccess(
@@ -259,7 +500,7 @@ func (backend SystemBackend) ensureSSHAdministratorAccess(
 		if len(administrator.AuthorizedKeySources) == 0 {
 			continue
 		}
-		state, err := backend.observeAdministrator(ctx, administrator)
+		state, err := backend.observeAdministrator(ctx, administrator, profile)
 		if err != nil {
 			return err
 		}
@@ -343,6 +584,21 @@ func (backend SystemBackend) observeFirewall(
 			enabled.ExitCode,
 		)
 	}
+	unitActive, err := backend.runRaw(ctx, execx.Spec{
+		Program: "systemctl",
+		Arguments: []string{
+			"is-active", "--", "ohtools-server-setup-firewall.service",
+		},
+	})
+	if err != nil {
+		return Observation{}, err
+	}
+	if unitActive.ExitCode != 0 && unitActive.ExitCode != 3 {
+		return Observation{}, fmt.Errorf(
+			"inspect firewall service active state: exit %d",
+			unitActive.ExitCode,
+		)
+	}
 	active, err := backend.runRaw(ctx, execx.Spec{
 		Program: "nft",
 		Arguments: []string{
@@ -362,7 +618,8 @@ func (backend SystemBackend) observeFirewall(
 	if err != nil {
 		return Observation{}, err
 	}
-	converged := enabled.ExitCode == 0 && active.ExitCode == 0 &&
+	converged := enabled.ExitCode == 0 && unitActive.ExitCode == 0 &&
+		active.ExitCode == 0 &&
 		firewallRulesEqual(active.Stdout, rules.Content)
 	summary := "firewall service or active rules differ from the desired state"
 	if converged {
@@ -460,10 +717,15 @@ func (backend SystemBackend) rollbackFirewall(
 	unitChanged bool,
 	previous firewallState,
 ) error {
+	cleanupContext, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		rollbackCommandTimeout,
+	)
+	defer cancel()
 	restoreErr := restoreFileSnapshots(snapshots)
 	var reloadErr error
 	if unitChanged {
-		_, reloadErr = backend.run(ctx, execx.Spec{
+		_, reloadErr = backend.run(cleanupContext, execx.Spec{
 			Program: "systemctl", Arguments: []string{"daemon-reload"},
 		})
 	}
@@ -471,14 +733,30 @@ func (backend SystemBackend) rollbackFirewall(
 	if previous.enabled {
 		action = "enable"
 	}
-	_, enablementErr := backend.run(ctx, execx.Spec{
+	_, enablementErr := backend.run(cleanupContext, execx.Spec{
 		Program: "systemctl",
 		Arguments: []string{
 			action, "--", "ohtools-server-setup-firewall.service",
 		},
 	})
-	activeErr := backend.restoreFirewallActiveState(ctx, previous)
-	return errors.Join(restoreErr, reloadErr, enablementErr, activeErr)
+	activeAction := "stop"
+	if previous.unitActive {
+		activeAction = "start"
+	}
+	_, unitActiveErr := backend.run(cleanupContext, execx.Spec{
+		Program: "systemctl",
+		Arguments: []string{
+			activeAction, "--", "ohtools-server-setup-firewall.service",
+		},
+	})
+	rulesErr := backend.restoreFirewallActiveState(cleanupContext, previous)
+	return errors.Join(
+		restoreErr,
+		reloadErr,
+		enablementErr,
+		unitActiveErr,
+		rulesErr,
+	)
 }
 
 func (backend SystemBackend) captureFirewallState(ctx context.Context) (firewallState, error) {
@@ -496,6 +774,22 @@ func (backend SystemBackend) captureFirewallState(ctx context.Context) (firewall
 		return state, fmt.Errorf("inspect firewall enablement: exit %d", enabled.ExitCode)
 	}
 	state.enabled = enabled.ExitCode == 0
+	unitActive, err := backend.runRaw(ctx, execx.Spec{
+		Program: "systemctl",
+		Arguments: []string{
+			"is-active", "--", "ohtools-server-setup-firewall.service",
+		},
+	})
+	if err != nil {
+		return state, err
+	}
+	if unitActive.ExitCode != 0 && unitActive.ExitCode != 3 {
+		return state, fmt.Errorf(
+			"inspect firewall unit active state: exit %d",
+			unitActive.ExitCode,
+		)
+	}
+	state.unitActive = unitActive.ExitCode == 0
 	active, err := backend.runRaw(ctx, execx.Spec{
 		Program: "nft",
 		Arguments: []string{
@@ -508,7 +802,7 @@ func (backend SystemBackend) captureFirewallState(ctx context.Context) (firewall
 	if active.ExitCode != 0 && active.ExitCode != 1 {
 		return state, fmt.Errorf("inspect active firewall rules: exit %d", active.ExitCode)
 	}
-	state.active = active.ExitCode == 0
+	state.rulesActive = active.ExitCode == 0
 	state.activeRules = append([]byte(nil), active.Stdout...)
 	return state, nil
 }
@@ -529,7 +823,7 @@ func (backend SystemBackend) restoreFirewallActiveState(
 	if deleted.ExitCode != 0 && deleted.ExitCode != 1 {
 		return fmt.Errorf("remove failed active firewall state: exit %d", deleted.ExitCode)
 	}
-	if !previous.active {
+	if !previous.rulesActive {
 		return nil
 	}
 	_, err = backend.run(ctx, execx.Spec{
@@ -670,6 +964,9 @@ func (backend SystemBackend) beginSSHInclude(
 ) (change sshIncludeChange, returnErr error) {
 	target := backend.path("/etc/ssh/sshd_config")
 	change.target = target
+	if err := backend.recoverSSHInclude(target); err != nil {
+		return change, err
+	}
 	includePresent, err := backend.sshIncludePresent()
 	if err != nil {
 		return change, err
@@ -724,6 +1021,10 @@ func (backend SystemBackend) beginSSHInclude(
 		_ = staged.Close()
 		return change, err
 	}
+	if err := staged.Sync(); err != nil {
+		_ = staged.Close()
+		return change, err
+	}
 	if err := staged.Close(); err != nil {
 		return change, err
 	}
@@ -754,6 +1055,37 @@ func (backend SystemBackend) beginSSHInclude(
 	return change, nil
 }
 
+func (backend SystemBackend) recoverSSHInclude(target string) error {
+	backup := target + ".ohtools-include.rollback"
+	backupExists, err := backend.trustedRecoveryArtifactExists(backup)
+	if err != nil {
+		return err
+	}
+	if backupExists {
+		targetExists, err := backend.trustedRecoveryArtifactExists(target)
+		if err != nil {
+			return err
+		}
+		if targetExists {
+			if err := os.Remove(target); err != nil {
+				return err
+			}
+			if err := syncDirectory(filepath.Dir(target)); err != nil {
+				return err
+			}
+		}
+		if err := os.Rename(backup, target); err != nil {
+			return err
+		}
+		if err := syncDirectory(filepath.Dir(target)); err != nil {
+			return err
+		}
+	}
+	return backend.removeTrustedRecoveryArtifact(
+		target + ".ohtools-include.stage",
+	)
+}
+
 func (change sshIncludeChange) rollback() error {
 	if !change.changed {
 		return nil
@@ -761,6 +1093,11 @@ func (change sshIncludeChange) rollback() error {
 	var failures []error
 	if err := os.Remove(change.target); err != nil && !errors.Is(err, os.ErrNotExist) {
 		failures = append(failures, err)
+	}
+	if len(failures) == 0 {
+		if err := syncDirectory(filepath.Dir(change.target)); err != nil {
+			failures = append(failures, err)
+		}
 	}
 	if err := os.Rename(change.backup, change.target); err != nil {
 		failures = append(failures, err)
@@ -925,7 +1262,10 @@ func (backend SystemBackend) packageInstalled(
 	return false, nil
 }
 
-func (backend SystemBackend) installZabbixRepository(ctx context.Context, config Config) error {
+func (backend SystemBackend) installZabbixRepository(
+	ctx context.Context,
+	config Config,
+) (returnErr error) {
 	if config.Zabbix == nil || !config.Zabbix.Enabled {
 		return errors.New("zabbix repository metadata is unavailable")
 	}
@@ -947,7 +1287,9 @@ func (backend SystemBackend) installZabbixRepository(ctx context.Context, config
 	if err != nil {
 		return fmt.Errorf("download Zabbix repository package: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		returnErr = errors.Join(returnErr, response.Body.Close())
+	}()
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("download Zabbix repository package: HTTP %d", response.StatusCode)
 	}
@@ -982,7 +1324,17 @@ func (backend SystemBackend) installZabbixRepository(ctx context.Context, config
 		return err
 	}
 	path := file.Name()
-	defer os.Remove(path)
+	defer func() {
+		removeErr := os.Remove(path)
+		if errors.Is(removeErr, os.ErrNotExist) {
+			removeErr = nil
+		}
+		var syncErr error
+		if removeErr == nil {
+			syncErr = syncDirectory(directory)
+		}
+		returnErr = errors.Join(returnErr, removeErr, syncErr)
+	}()
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
 		return err
@@ -1072,7 +1424,7 @@ func (backend SystemBackend) observeUsers(
 	missingGroups := map[string]any{}
 	missingKeys := []string{}
 	for _, administrator := range profile.Config.Administrators {
-		state, err := backend.observeAdministrator(ctx, administrator)
+		state, err := backend.observeAdministrator(ctx, administrator, profile)
 		if err != nil {
 			return Observation{}, err
 		}
@@ -1105,7 +1457,7 @@ func (backend SystemBackend) observeUsers(
 
 func (backend SystemBackend) applyUsers(ctx context.Context, profile Profile) error {
 	for _, administrator := range profile.Config.Administrators {
-		state, err := backend.observeAdministrator(ctx, administrator)
+		state, err := backend.observeAdministrator(ctx, administrator, profile)
 		if err != nil {
 			return err
 		}
@@ -1123,7 +1475,7 @@ func (backend SystemBackend) applyUsers(ctx context.Context, profile Profile) er
 				return err
 			}
 			if len(administrator.AuthorizedKeySources) > 0 {
-				state, err = backend.observeAdministrator(ctx, administrator)
+				state, err = backend.observeAdministrator(ctx, administrator, profile)
 				if err != nil {
 					return err
 				}
@@ -1145,7 +1497,7 @@ func (backend SystemBackend) applyUsers(ctx context.Context, profile Profile) er
 				return err
 			}
 		}
-		if err := backend.installAuthorizedKeys(administrator, state); err != nil {
+		if err := backend.installAuthorizedKeys(administrator, state, profile); err != nil {
 			return err
 		}
 	}
@@ -1165,6 +1517,7 @@ type administratorState struct {
 func (backend SystemBackend) observeAdministrator(
 	ctx context.Context,
 	administrator Administrator,
+	profile Profile,
 ) (administratorState, error) {
 	output, err := backend.runRaw(ctx, execx.Spec{
 		Program: "id", Arguments: []string{"-u", "--", administrator.Name},
@@ -1252,7 +1605,7 @@ func (backend SystemBackend) observeAdministrator(
 		sort.Strings(state.MissingGroups)
 	}
 	if len(administrator.AuthorizedKeySources) > 0 {
-		converged, err := backend.authorizedKeysConverged(administrator, state)
+		converged, err := backend.authorizedKeysConverged(administrator, state, profile)
 		if err != nil {
 			return administratorState{}, err
 		}
@@ -1264,11 +1617,12 @@ func (backend SystemBackend) observeAdministrator(
 func (backend SystemBackend) installAuthorizedKeys(
 	administrator Administrator,
 	state administratorState,
+	profile Profile,
 ) error {
 	if len(administrator.AuthorizedKeySources) == 0 {
 		return nil
 	}
-	keys, err := backend.desiredAuthorizedKeys(administrator)
+	keys, err := backend.desiredAuthorizedKeysForProfile(administrator, profile)
 	if err != nil {
 		return err
 	}
@@ -1286,13 +1640,25 @@ func (backend SystemBackend) desiredAuthorizedKeys(
 	keys := []string{}
 	for _, source := range administrator.AuthorizedKeySources {
 		trustedPath := backend.path(source)
-		info, err := os.Lstat(trustedPath)
+		if err := validateExistingDirectoryChain(
+			filepath.Dir(trustedPath),
+			backend.Root != "",
+		); err != nil {
+			return nil, fmt.Errorf("validate authorized key source directory: %w", err)
+		}
+		file, err := openTrustedKeySource(trustedPath)
 		if err != nil {
-			return nil, fmt.Errorf("inspect authorized key source: %w", err)
+			return nil, fmt.Errorf("open authorized key source without following links: %w", err)
+		}
+		info, err := file.Stat()
+		if err != nil {
+			_ = file.Close()
+			return nil, err
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() ||
 			runtime.GOOS != "windows" && info.Mode().Perm()&0o022 != 0 ||
 			info.Size() > 1<<20 {
+			_ = file.Close()
 			return nil, fmt.Errorf("authorized key source %s is unsafe", source)
 		}
 		if err := validateTrustedKeySource(
@@ -1300,10 +1666,19 @@ func (backend SystemBackend) desiredAuthorizedKeys(
 			info,
 			backend.Root != "",
 		); err != nil {
+			_ = file.Close()
 			return nil, err
 		}
-		content, err := os.ReadFile(trustedPath) // #nosec G304 -- validated fixed config path.
+		content, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
 		if err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		if len(content) > 1<<20 {
+			_ = file.Close()
+			return nil, fmt.Errorf("authorized key source %s is oversized", source)
+		}
+		if err := file.Close(); err != nil {
 			return nil, err
 		}
 		for _, line := range strings.Split(string(content), "\n") {
@@ -1321,11 +1696,22 @@ func (backend SystemBackend) desiredAuthorizedKeys(
 	return keys, nil
 }
 
+func (backend SystemBackend) desiredAuthorizedKeysForProfile(
+	administrator Administrator,
+	profile Profile,
+) ([]string, error) {
+	if keys, ok := profile.DesiredAuthorizedKeys[administrator.Name]; ok {
+		return append([]string(nil), keys...), nil
+	}
+	return backend.desiredAuthorizedKeys(administrator)
+}
+
 func (backend SystemBackend) authorizedKeysConverged(
 	administrator Administrator,
 	state administratorState,
+	profile Profile,
 ) (bool, error) {
-	desired, err := backend.desiredAuthorizedKeys(administrator)
+	desired, err := backend.desiredAuthorizedKeysForProfile(administrator, profile)
 	if err != nil {
 		return false, err
 	}
@@ -1390,7 +1776,10 @@ func (backend SystemBackend) validateAdministratorHome(
 	state administratorState,
 ) error {
 	target := backend.path(state.Home)
-	if err := secureMkdirAll(filepath.Dir(target), 0o755, backend.Root != ""); err != nil {
+	if err := validateExistingDirectoryChain(
+		filepath.Dir(target),
+		backend.Root != "",
+	); err != nil {
 		return err
 	}
 	info, err := os.Lstat(target)
@@ -1407,6 +1796,41 @@ func (backend SystemBackend) validateAdministratorHome(
 		true,
 		backend.Root != "",
 	)
+}
+
+func validateExistingDirectoryChain(
+	directory string,
+	allowCurrentOwner bool,
+) error {
+	absolute, err := filepath.Abs(directory)
+	if err != nil {
+		return err
+	}
+	volume := filepath.VolumeName(absolute)
+	current := volume + string(filepath.Separator)
+	relative := strings.TrimPrefix(absolute, current)
+	for _, segment := range strings.Split(relative, string(filepath.Separator)) {
+		if segment == "" {
+			continue
+		}
+		current = filepath.Join(current, segment)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("directory %s is unsafe", current)
+		}
+		if err := validateManagedPath(
+			current,
+			info,
+			true,
+			allowCurrentOwner,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (backend SystemBackend) ensureAdministratorSSHDirectory(
@@ -1654,7 +2078,7 @@ func (backend SystemBackend) activateManagedFileWithPostVerify(
 	postVerify func() error,
 ) (returnErr error) {
 	target := backend.path(managed.Path)
-	if err := ensureNoManagedTransactionArtifacts(target); err != nil {
+	if err := backend.recoverManagedTransaction(target); err != nil {
 		return err
 	}
 	if err := secureMkdirAll(
@@ -1664,7 +2088,9 @@ func (backend SystemBackend) activateManagedFileWithPostVerify(
 	); err != nil {
 		return err
 	}
+	hadTarget := false
 	if info, err := os.Lstat(target); err == nil {
+		hadTarget = true
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return fmt.Errorf("managed path %s is unsafe", managed.Path)
 		}
@@ -1688,8 +2114,8 @@ func (backend SystemBackend) activateManagedFileWithPostVerify(
 	stagedPath := staged.Name()
 	defer func() {
 		if cleanupErr := os.Remove(stagedPath); cleanupErr != nil &&
-			!errors.Is(cleanupErr, os.ErrNotExist) && returnErr == nil {
-			returnErr = cleanupErr
+			!errors.Is(cleanupErr, os.ErrNotExist) {
+			returnErr = errors.Join(returnErr, cleanupErr)
 		}
 	}()
 	if _, err := staged.Write(managed.Content); err != nil {
@@ -1704,7 +2130,19 @@ func (backend SystemBackend) activateManagedFileWithPostVerify(
 		_ = staged.Close()
 		return err
 	}
+	if err := staged.Sync(); err != nil {
+		_ = staged.Close()
+		return err
+	}
 	if err := staged.Close(); err != nil {
+		return err
+	}
+	journal := managedTransactionJournal{
+		SchemaVersion: "1",
+		Phase:         "staged",
+		HadTarget:     hadTarget,
+	}
+	if err := writeManagedTransactionJournal(target, journal); err != nil {
 		return err
 	}
 	if managed.Validate != nil {
@@ -1714,32 +2152,66 @@ func (backend SystemBackend) activateManagedFileWithPostVerify(
 		}
 	}
 	backup := target + ".rollback"
-	hadTarget := false
-	if _, err := os.Lstat(target); err == nil {
+	if hadTarget {
 		if err := os.Rename(target, backup); err != nil {
 			return fmt.Errorf("backup %s: %w", managed.Path, err)
 		}
-		hadTarget = true
+		if err := syncDirectory(filepath.Dir(target)); err != nil {
+			return errors.Join(err, backend.recoverManagedTransaction(target))
+		}
+		journal.Phase = "backed_up"
+		if err := writeManagedTransactionJournal(target, journal); err != nil {
+			return errors.Join(err, backend.recoverManagedTransaction(target))
+		}
 	}
 	if err := os.Rename(stagedPath, target); err != nil {
-		if hadTarget {
-			_ = os.Rename(backup, target)
-		}
-		return fmt.Errorf("activate %s: %w", managed.Path, err)
+		return errors.Join(
+			fmt.Errorf("activate %s: %w", managed.Path, err),
+			backend.recoverManagedTransaction(target),
+		)
 	}
 	if err := syncDirectory(filepath.Dir(target)); err != nil {
-		return backend.rollbackManaged(target, backup, hadTarget, err)
+		return backend.rollbackManaged(ctx, target, backup, hadTarget, err, nil)
+	}
+	journal.Phase = "activated"
+	if err := writeManagedTransactionJournal(target, journal); err != nil {
+		return backend.rollbackManaged(ctx, target, backup, hadTarget, err, nil)
 	}
 	if managed.Activation != nil {
 		spec := expandManagedSpec(*managed.Activation, stagedPath, target)
 		if _, err := backend.run(ctx, spec); err != nil {
-			return backend.rollbackManaged(target, backup, hadTarget, err)
+			return backend.rollbackManaged(
+				ctx,
+				target,
+				backup,
+				hadTarget,
+				err,
+				managed.Activation,
+			)
 		}
 	}
 	if postVerify != nil {
 		if err := postVerify(); err != nil {
-			return backend.rollbackManaged(target, backup, hadTarget, err)
+			return backend.rollbackManaged(
+				ctx,
+				target,
+				backup,
+				hadTarget,
+				err,
+				managed.Activation,
+			)
 		}
+	}
+	journal.Phase = "verified"
+	if err := writeManagedTransactionJournal(target, journal); err != nil {
+		return backend.rollbackManaged(
+			ctx,
+			target,
+			backup,
+			hadTarget,
+			err,
+			managed.Activation,
+		)
 	}
 	if hadTarget {
 		if err := os.Remove(backup); err != nil {
@@ -1749,11 +2221,16 @@ func (backend SystemBackend) activateManagedFileWithPostVerify(
 			return err
 		}
 	}
-	return nil
+	return removeManagedTransactionJournal(target)
 }
 
 func ensureNoManagedTransactionArtifacts(target string) error {
-	for _, suffix := range []string{".stage", ".rollback"} {
+	for _, suffix := range []string{
+		".stage",
+		".rollback",
+		".transaction-v1.json",
+		".transaction-v1.json.stage",
+	} {
 		artifact := target + suffix
 		if _, err := os.Lstat(artifact); err == nil {
 			return fmt.Errorf(
@@ -1768,26 +2245,275 @@ func ensureNoManagedTransactionArtifacts(target string) error {
 }
 
 func (backend SystemBackend) rollbackManaged(
+	ctx context.Context,
 	target string,
 	backup string,
 	hadTarget bool,
 	cause error,
+	activation *execx.Spec,
 ) error {
+	journalErr := writeManagedTransactionJournal(target, managedTransactionJournal{
+		SchemaVersion: "1",
+		Phase:         "rolling_back",
+		HadTarget:     hadTarget,
+	})
+	if journalErr != nil {
+		return errors.Join(
+			fmt.Errorf("activate managed file: %w", cause),
+			fmt.Errorf("record managed rollback: %w", journalErr),
+		)
+	}
 	removeErr := os.Remove(target)
 	if errors.Is(removeErr, os.ErrNotExist) {
 		removeErr = nil
 	}
+	removeSyncErr := error(nil)
+	if removeErr == nil {
+		removeSyncErr = syncDirectory(filepath.Dir(target))
+	}
 	var restoreErr error
-	if hadTarget {
+	if hadTarget && removeSyncErr == nil {
 		restoreErr = os.Rename(backup, target)
 	}
 	syncErr := syncDirectory(filepath.Dir(target))
+	var activationErr error
+	if removeErr == nil && removeSyncErr == nil &&
+		restoreErr == nil && syncErr == nil && activation != nil {
+		cleanupContext, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			rollbackCommandTimeout,
+		)
+		spec := expandManagedSpec(*activation, "", target)
+		_, activationErr = backend.run(cleanupContext, spec)
+		cancel()
+	}
+	var removeJournalErr error
+	if removeErr == nil && removeSyncErr == nil &&
+		restoreErr == nil && syncErr == nil && activationErr == nil {
+		removeJournalErr = removeManagedTransactionJournal(target)
+	}
 	return errors.Join(
 		fmt.Errorf("activate managed file: %w", cause),
 		removeErr,
+		removeSyncErr,
 		restoreErr,
 		syncErr,
+		activationErr,
+		removeJournalErr,
 	)
+}
+
+func writeManagedTransactionJournal(
+	target string,
+	journal managedTransactionJournal,
+) error {
+	encoded, err := json.Marshal(journal)
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	return writeFileAtomic(target+".transaction-v1.json", encoded, 0o600)
+}
+
+func removeManagedTransactionJournal(target string) error {
+	journal := target + ".transaction-v1.json"
+	if err := os.Remove(journal); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDirectory(filepath.Dir(target))
+}
+
+func (backend SystemBackend) recoverManagedTransaction(target string) error {
+	journalPath := target + ".transaction-v1.json"
+	journalTemp := journalPath + ".stage"
+	if err := backend.removeTrustedRecoveryArtifact(journalTemp); err != nil {
+		return err
+	}
+	info, err := os.Lstat(journalPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return backend.recoverLegacyManagedArtifacts(target)
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() ||
+		info.Size() > 4096 ||
+		runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		return errors.New("managed transaction journal is unsafe")
+	}
+	if err := validateManagedPath(
+		journalPath,
+		info,
+		false,
+		backend.Root != "",
+	); err != nil {
+		return err
+	}
+	content, err := os.ReadFile(journalPath) // #nosec G304 -- derived trusted path.
+	if err != nil {
+		return err
+	}
+	var journal managedTransactionJournal
+	if err := strictjson.Decode(content, &journal); err != nil {
+		return fmt.Errorf("decode managed transaction journal: %w", err)
+	}
+	if journal.SchemaVersion != "1" {
+		return errors.New("unsupported managed transaction journal schema")
+	}
+	switch journal.Phase {
+	case "staged", "backed_up", "activated", "verified", "rolling_back":
+	default:
+		return errors.New("invalid managed transaction journal phase")
+	}
+	if journal.Phase == "backed_up" && !journal.HadTarget {
+		return errors.New("managed transaction journal has an impossible state")
+	}
+	if journal.Phase == "verified" {
+		targetExists, err := backend.trustedRecoveryArtifactExists(target)
+		if err != nil {
+			return err
+		}
+		if !targetExists {
+			return errors.New("verified managed transaction target is missing")
+		}
+		if err := backend.removeTrustedRecoveryArtifact(target + ".stage"); err != nil {
+			return err
+		}
+		if err := backend.removeTrustedRecoveryArtifact(target + ".rollback"); err != nil {
+			return err
+		}
+		return removeManagedTransactionJournal(target)
+	}
+	if err := backend.rollbackInterruptedManagedTransaction(target, journal); err != nil {
+		return err
+	}
+	return removeManagedTransactionJournal(target)
+}
+
+func (backend SystemBackend) rollbackInterruptedManagedTransaction(
+	target string,
+	journal managedTransactionJournal,
+) error {
+	stage := target + ".stage"
+	backup := target + ".rollback"
+	backupExists, err := backend.trustedRecoveryArtifactExists(backup)
+	if err != nil {
+		return err
+	}
+	targetExists, err := backend.trustedRecoveryArtifactExists(target)
+	if err != nil {
+		return err
+	}
+	if journal.Phase == "rolling_back" {
+		if !journal.HadTarget && backupExists {
+			return errors.New("managed rollback has an unexpected backup file")
+		}
+		if journal.HadTarget && !backupExists && !targetExists {
+			return errors.New("managed rollback original target is missing")
+		}
+		if !journal.HadTarget && targetExists {
+			if err := os.Remove(target); err != nil {
+				return err
+			}
+			if err := syncDirectory(filepath.Dir(target)); err != nil {
+				return err
+			}
+		}
+	}
+	if backupExists {
+		if targetExists {
+			if err := os.Remove(target); err != nil {
+				return err
+			}
+			if err := syncDirectory(filepath.Dir(target)); err != nil {
+				return err
+			}
+		}
+		if err := os.Rename(backup, target); err != nil {
+			return err
+		}
+		if err := syncDirectory(filepath.Dir(target)); err != nil {
+			return err
+		}
+	} else if journal.HadTarget {
+		if journal.Phase == "backed_up" || journal.Phase == "activated" {
+			return errors.New("managed transaction rollback file is missing")
+		}
+		if journal.Phase == "staged" && !targetExists {
+			return errors.New("managed transaction original target is missing")
+		}
+	} else if (journal.Phase == "staged" || journal.Phase == "activated") &&
+		targetExists {
+		if err := os.Remove(target); err != nil {
+			return err
+		}
+		if err := syncDirectory(filepath.Dir(target)); err != nil {
+			return err
+		}
+	}
+	return backend.removeTrustedRecoveryArtifact(stage)
+}
+
+func (backend SystemBackend) recoverLegacyManagedArtifacts(target string) error {
+	backup := target + ".rollback"
+	backupExists, err := backend.trustedRecoveryArtifactExists(backup)
+	if err != nil {
+		return err
+	}
+	if backupExists {
+		targetExists, err := backend.trustedRecoveryArtifactExists(target)
+		if err != nil {
+			return err
+		}
+		if targetExists {
+			if err := os.Remove(target); err != nil {
+				return err
+			}
+			if err := syncDirectory(filepath.Dir(target)); err != nil {
+				return err
+			}
+		}
+		if err := os.Rename(backup, target); err != nil {
+			return err
+		}
+		if err := syncDirectory(filepath.Dir(target)); err != nil {
+			return err
+		}
+	}
+	return backend.removeTrustedRecoveryArtifact(target + ".stage")
+}
+
+func (backend SystemBackend) trustedRecoveryArtifactExists(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false, fmt.Errorf("managed recovery artifact %s is unsafe", path)
+	}
+	if err := validateManagedPath(
+		path,
+		info,
+		false,
+		backend.Root != "",
+	); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (backend SystemBackend) removeTrustedRecoveryArtifact(path string) error {
+	exists, err := backend.trustedRecoveryArtifactExists(path)
+	if err != nil || !exists {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
 }
 
 func expandManagedSpec(spec execx.Spec, staged string, target string) execx.Spec {
@@ -1867,8 +2593,8 @@ func writeFileAtomicForAdministrator(
 	staged := file.Name()
 	defer func() {
 		if cleanupErr := os.Remove(staged); cleanupErr != nil &&
-			!errors.Is(cleanupErr, os.ErrNotExist) && returnErr == nil {
-			returnErr = cleanupErr
+			!errors.Is(cleanupErr, os.ErrNotExist) {
+			returnErr = errors.Join(returnErr, cleanupErr)
 		}
 	}()
 	if _, err := file.Write(content); err != nil {
@@ -1892,6 +2618,10 @@ func writeFileAtomicForAdministrator(
 		_ = file.Close()
 		return err
 	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
 	if err := file.Close(); err != nil {
 		return err
 	}
@@ -1909,8 +2639,8 @@ func writeFileAtomic(target string, content []byte, mode fs.FileMode) (returnErr
 	staged := file.Name()
 	defer func() {
 		if cleanupErr := os.Remove(staged); cleanupErr != nil &&
-			!errors.Is(cleanupErr, os.ErrNotExist) && returnErr == nil {
-			returnErr = cleanupErr
+			!errors.Is(cleanupErr, os.ErrNotExist) {
+			returnErr = errors.Join(returnErr, cleanupErr)
 		}
 	}()
 	if _, err := file.Write(content); err != nil {
@@ -1922,6 +2652,10 @@ func writeFileAtomic(target string, content []byte, mode fs.FileMode) (returnErr
 		return err
 	}
 	if err := file.Chmod(mode); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
 		_ = file.Close()
 		return err
 	}

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +24,23 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	case "exit":
 		os.Exit(23)
+	case "spawn-descendant":
+		child := exec.Command(os.Args[0], "-test.run=^$")
+		child.Env = append(os.Environ(), "GO_WANT_EXECX_HELPER=descendant")
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			os.Exit(24)
+		}
+		time.Sleep(5 * time.Second)
+		os.Exit(0)
+	case "descendant":
+		time.Sleep(250 * time.Millisecond)
+		if marker := os.Getenv("GO_WANT_EXECX_MARKER"); marker != "" {
+			_ = os.WriteFile(marker, []byte("orphan mutation"), 0o600)
+		}
+		time.Sleep(3 * time.Second)
+		os.Exit(0)
 	}
 	os.Exit(m.Run())
 }
@@ -90,6 +109,29 @@ func TestRunnerStopsAtDeadlineAndReportsNonZeroExit(t *testing.T) {
 	})
 	if err != nil || output.ExitCode != 23 {
 		t.Fatalf("non-zero error=%v output=%#v", err, output)
+	}
+}
+
+func TestRunnerBoundsCleanupWhenDescendantKeepsProtocolPipesOpen(t *testing.T) {
+	program := copyTestExecutable(t)
+	runner := OSRunner{Resolver: Resolver{Directories: []string{filepath.Dir(program)}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := runner.Run(ctx, Spec{
+		Program: filepath.Base(program),
+		Environment: map[string]string{
+			"GO_WANT_EXECX_HELPER": "spawn-descendant",
+		},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runner error = %v", err)
+	}
+	if runtime.GOOS != "windows" && !strings.Contains(err.Error(), "cleanup") {
+		t.Fatalf("incomplete descendant cleanup was not surfaced: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("runner cleanup was unbounded: %s", elapsed)
 	}
 }
 

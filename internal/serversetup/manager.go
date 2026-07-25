@@ -22,9 +22,10 @@ type Observation struct {
 }
 
 type Profile struct {
-	Platform Platform
-	Config   Config
-	Items    []Item
+	Platform              Platform
+	Config                Config
+	Items                 []Item
+	DesiredAuthorizedKeys map[string][]string
 }
 
 type Backend interface {
@@ -35,7 +36,7 @@ type Backend interface {
 }
 
 type DesiredStateMaterialProvider interface {
-	DesiredStateMaterial(context.Context, Profile) (map[string]string, error)
+	PrepareDesiredState(context.Context, *Profile) (map[string]string, error)
 }
 
 type Manager struct {
@@ -147,7 +148,7 @@ func (manager Manager) Plan(ctx context.Context, requested []string) (protocol.P
 		Config:   manager.Config,
 		Items:    append([]Item(nil), items...),
 	}
-	desiredStateSHA256, err := manager.desiredStateFingerprint(ctx, profile)
+	desiredStateSHA256, err := manager.desiredStateFingerprint(ctx, &profile)
 	if err != nil {
 		return protocol.Plan{}, fmt.Errorf("fingerprint desired setup state: %w", err)
 	}
@@ -200,7 +201,7 @@ func (manager Manager) Apply(ctx context.Context, approved protocol.Plan) (proto
 	if err != nil {
 		return protocol.Result{}, protocol.ExitError{Code: protocol.ExitArguments, Err: err}
 	}
-	currentFingerprint, err := manager.desiredStateFingerprint(ctx, profile)
+	currentFingerprint, err := manager.desiredStateFingerprint(ctx, &profile)
 	if err != nil {
 		return protocol.Result{}, err
 	}
@@ -306,13 +307,13 @@ func changeReason(count int) string {
 
 func (manager Manager) desiredStateFingerprint(
 	ctx context.Context,
-	profile Profile,
+	profile *Profile,
 ) (string, error) {
 	config := normalizedConfig(profile.Config)
 	material := map[string]string{}
 	if provider, ok := manager.Backend.(DesiredStateMaterialProvider); ok {
 		var err error
-		material, err = provider.DesiredStateMaterial(ctx, profile)
+		material, err = provider.PrepareDesiredState(ctx, profile)
 		if err != nil {
 			return "", err
 		}
