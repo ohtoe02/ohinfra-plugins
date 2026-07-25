@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ohtoe02/ohtools-plugin-catalog/contracts/protocol-v1/invocation.schema.json",
+  "title": "ohtools executable plugin invocation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "request_id",
+    "command_path",
+    "arguments",
+    "options"
+  ],
+  "properties": {
+    "protocol_version": {
+      "const": 1
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "command_path": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]*$"
+      }
+    },
+    "arguments": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "options": {
+      "type": "object"
+    },
+    "deadline": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "plan_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

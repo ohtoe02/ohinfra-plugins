@@ -1,6 +1,7 @@
 package protocol_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -36,6 +37,7 @@ func TestFirstPartyManifestCompatibility(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			want = bytes.ReplaceAll(want, []byte("\r\n"), []byte("\n"))
 			if string(got) != string(want) {
 				t.Fatalf("manifest changed; got:\n%s\nwant:\n%s", got, want)
 			}

@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ohtoe02/ohtools-plugin-catalog/contracts/protocol-v1/plan.schema.json",
+  "title": "ohtools executable plugin operation plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "command_id",
+    "summary",
+    "checks",
+    "changes",
+    "risks",
+    "requires_root",
+    "requires_force",
+    "requires_confirmation"
+  ],
+  "properties": {
+    "command_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/check"
+      }
+    },
+    "changes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/change"
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "requires_root": {
+      "type": "boolean"
+    },
+    "requires_force": {
+      "type": "boolean"
+    },
+    "requires_confirmation": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "status",
+        "summary"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "pass",
+            "info",
+            "warning",
+            "critical",
+            "skipped",
+            "partial",
+            "error",
+            "cancelled"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "details": {
+          "type": "object"
+        }
+      }
+    },
+    "change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "object",
+        "action",
+        "status"
+      ],
+      "properties": {
+        "object": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "details": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}
