@@ -95,6 +95,24 @@ func TestRestartRejectsUnapprovedPlanDigest(t *testing.T) {
 	}
 }
 
+func TestRestartPlannerUsesOnlyReadOnlyInspection(t *testing.T) {
+	var programs []execx.Spec
+	definition := NewDefinition(Options{
+		ConfigPath: filepath.Join(t.TempDir(), "missing.yaml"),
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			programs = append(programs, spec)
+			return execx.Output{Stdout: []byte("Id=nginx.service\nActiveState=active\n")}, nil
+		}),
+	})
+	if _, err := definition.Plan(context.Background(), invocation("restart", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if len(programs) != 1 || programs[0].Program != "systemctl" ||
+		len(programs[0].Arguments) == 0 || programs[0].Arguments[0] != "show" {
+		t.Fatalf("planner executed mutation-capable commands: %#v", programs)
+	}
+}
+
 func invocation(command string, options map[string]any) protocol.Invocation {
 	if options == nil {
 		options = map[string]any{}

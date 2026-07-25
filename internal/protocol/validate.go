@@ -12,6 +12,12 @@ import (
 
 var identifier = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 
+var reservedFlags = map[string]struct{}{
+	"config": {}, "debug": {}, "dry-run": {}, "force": {}, "help": {}, "json": {},
+	"no-color": {}, "output": {}, "quiet": {}, "retry-request-id": {}, "timeout": {},
+	"verbose": {}, "version": {}, "yes": {},
+}
+
 func ValidateDescription(value string) error {
 	if value == "" {
 		return nil
@@ -72,6 +78,19 @@ func validateCommand(command Command) error {
 			return fmt.Errorf("invalid command segment %q", segment)
 		}
 	}
+	if command.Use != "" {
+		if err := ValidateDescription(command.Use); err != nil {
+			return fmt.Errorf("invalid command use: %w", err)
+		}
+		useName, _, _ := strings.Cut(command.Use, " ")
+		if useName != command.Path[len(command.Path)-1] {
+			return fmt.Errorf("command use %q does not match path %q",
+				command.Use, strings.Join(command.Path, " "))
+		}
+	}
+	if err := ValidateDescription(command.Short); err != nil {
+		return fmt.Errorf("invalid command short description: %w", err)
+	}
 	switch command.Category {
 	case CategoryDiagnostic:
 	case CategoryOperational, CategoryRunbook:
@@ -85,9 +104,17 @@ func validateCommand(command Command) error {
 		return errors.New("command argument or flag count exceeds 64")
 	}
 	optionalSeen := false
+	seenArguments := map[string]struct{}{}
 	for index, argument := range command.Arguments {
 		if !identifier.MatchString(argument.Name) {
 			return fmt.Errorf("invalid argument name %q", argument.Name)
+		}
+		if _, duplicate := seenArguments[argument.Name]; duplicate {
+			return fmt.Errorf("duplicate argument %q", argument.Name)
+		}
+		seenArguments[argument.Name] = struct{}{}
+		if err := ValidateDescription(argument.Description); err != nil {
+			return fmt.Errorf("invalid argument %q description: %w", argument.Name, err)
 		}
 		if argument.Required && optionalSeen {
 			return fmt.Errorf("required argument %q follows an optional argument", argument.Name)
@@ -107,7 +134,13 @@ func validateCommand(command Command) error {
 		if _, duplicate := seenFlags[flag.Name]; duplicate {
 			return fmt.Errorf("duplicate flag %q", flag.Name)
 		}
+		if _, reserved := reservedFlags[flag.Name]; reserved {
+			return fmt.Errorf("flag %q is reserved by the host", flag.Name)
+		}
 		seenFlags[flag.Name] = struct{}{}
+		if err := ValidateDescription(flag.Description); err != nil {
+			return fmt.Errorf("invalid flag %q description: %w", flag.Name, err)
+		}
 		if err := validateFlag(flag); err != nil {
 			return err
 		}

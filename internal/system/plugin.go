@@ -55,27 +55,25 @@ func NewDefinition(options Options) protocol.Definition {
 	if options.Storage.MountInfoPath == "" {
 		options.Storage = storage.DefaultCollector()
 	}
-	commands := []protocol.Command{
-		{
+	bindings := []protocol.Binding{
+		protocol.Diagnostic(protocol.CommandSpec{
 			Path: []string{"system", "info"}, Use: "info",
-			Short: "Show operating system information", Category: protocol.CategoryDiagnostic,
+			Short:     "Show operating system information",
 			Arguments: []protocol.Argument{}, Flags: []protocol.Flag{},
-		},
-		{
-			Path: []string{"system", "health"}, Use: "health",
-			Short: "Run operating system health checks", Category: protocol.CategoryDiagnostic,
-			Arguments: []protocol.Argument{}, Flags: []protocol.Flag{},
-		},
-	}
-	return protocol.Definition{
-		Manifest: protocol.Manifest{
-			ProtocolVersion: protocol.ProtocolVersion, Name: Name,
-			Version: options.Version, Description: Description, Commands: commands,
-		},
-		Execute: func(ctx context.Context, invocation protocol.Invocation) (protocol.Result, error) {
+		}, func(ctx context.Context, invocation protocol.Invocation) (protocol.Result, error) {
 			return execute(ctx, invocation, options)
-		},
+		}),
+		protocol.Diagnostic(protocol.CommandSpec{
+			Path: []string{"system", "health"}, Use: "health",
+			Short:     "Run operating system health checks",
+			Arguments: []protocol.Argument{}, Flags: []protocol.Flag{},
+		}, func(ctx context.Context, invocation protocol.Invocation) (protocol.Result, error) {
+			return execute(ctx, invocation, options)
+		}),
 	}
+	return protocol.NewDefinition(protocol.DefinitionSpec{
+		Name: Name, Version: options.Version, Description: Description,
+	}, bindings...)
 }
 
 func execute(ctx context.Context, invocation protocol.Invocation, options Options) (protocol.Result, error) {

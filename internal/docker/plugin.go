@@ -74,34 +74,31 @@ func NewDefinition(options Options) protocol.Definition {
 	if options.RegistryProbe == nil {
 		options.RegistryProbe = probeRegistry
 	}
-	return protocol.Definition{
-		Manifest: protocol.Manifest{
-			ProtocolVersion: protocol.ProtocolVersion, Name: Name,
-			Version: options.Version, Description: Description, Commands: manifestCommands(),
-		},
-		Execute: func(ctx context.Context, invocation protocol.Invocation) (protocol.Result, error) {
-			return execute(ctx, invocation, options)
-		},
-	}
+	return protocol.NewDefinition(
+		protocol.DefinitionSpec{Name: Name, Version: options.Version, Description: Description},
+		manifestBindings(options)...,
+	)
 }
 
-func manifestCommands() []protocol.Command {
+func manifestBindings(options Options) []protocol.Binding {
 	object := []protocol.Argument{{Name: "object", Description: "Docker object identifier", Required: true}}
 	container := []protocol.Argument{{Name: "container", Description: "Container name or ID", Required: true}}
 	file := []protocol.Argument{{Name: "file", Description: "Compose YAML file", Required: true}}
-	diagnostic := func(path []string, use, short string, arguments []protocol.Argument, flags []protocol.Flag) protocol.Command {
+	diagnostic := func(path []string, use, short string, arguments []protocol.Argument, flags []protocol.Flag) protocol.Binding {
 		if arguments == nil {
 			arguments = []protocol.Argument{}
 		}
 		if flags == nil {
 			flags = []protocol.Flag{}
 		}
-		return protocol.Command{
-			Path: path, Use: use, Short: short, Category: protocol.CategoryDiagnostic,
+		return protocol.Diagnostic(protocol.CommandSpec{
+			Path: path, Use: use, Short: short,
 			Arguments: arguments, Flags: flags,
-		}
+		}, func(ctx context.Context, invocation protocol.Invocation) (protocol.Result, error) {
+			return execute(ctx, invocation, options)
+		})
 	}
-	return []protocol.Command{
+	return []protocol.Binding{
 		diagnostic([]string{"docker", "status"}, "status", "Check Docker client and daemon availability", nil, nil),
 		diagnostic([]string{"docker", "info"}, "info", "Show Docker daemon information", nil, nil),
 		diagnostic([]string{"docker", "ps"}, "ps", "List Docker containers", nil, nil),

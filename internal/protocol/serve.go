@@ -60,9 +60,14 @@ func Serve(
 		}
 		return ExitOK
 	case "plan", "execute":
-		encoded, err := io.ReadAll(io.LimitReader(stdin, 1<<20))
+		const maxInvocationBytes = 1 << 20
+		encoded, err := io.ReadAll(io.LimitReader(stdin, maxInvocationBytes+1))
 		if err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
+			return ExitArguments
+		}
+		if len(encoded) > maxInvocationBytes {
+			_, _ = fmt.Fprintln(stderr, "invocation exceeds 1048576 bytes")
 			return ExitArguments
 		}
 		var invocation Invocation
@@ -72,6 +77,11 @@ func Serve(
 		}
 		if invocation.ProtocolVersion != ProtocolVersion {
 			_, _ = fmt.Fprintln(stderr, "unsupported protocol version")
+			return ExitArguments
+		}
+		if invocation.RequestID == "" || len(invocation.RequestID) > 128 ||
+			strings.TrimSpace(invocation.RequestID) != invocation.RequestID {
+			_, _ = fmt.Fprintln(stderr, "request_id must be a non-empty value of at most 128 bytes")
 			return ExitArguments
 		}
 		if invocation.Arguments == nil {
@@ -123,13 +133,18 @@ func Serve(
 }
 
 func PlanDigest(plan Plan) (string, error) {
-	normalizePlan(&plan)
+	plan = NormalizePlan(plan)
 	encoded, err := json.Marshal(plan)
 	if err != nil {
 		return "", fmt.Errorf("encode operation plan: %w", err)
 	}
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func NormalizePlan(plan Plan) Plan {
+	normalizePlan(&plan)
+	return plan
 }
 
 func normalizePlan(plan *Plan) {

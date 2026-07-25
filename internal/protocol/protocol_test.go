@@ -185,6 +185,8 @@ func TestServeExecuteStrictlyDecodesInvocationAndNormalizesResult(t *testing.T) 
 		`{"protocol_version":1,"unknown":true}`,
 		`{"protocol_version":1,"protocol_version":1}`,
 		`{"protocol_version":1} {}`,
+		`{"protocol_version":1,"request_id":"request-1","command_path":["system","info"],"arguments":[],"options":{}}` +
+			strings.Repeat(" ", 1<<20),
 	} {
 		stdout.Reset()
 		stderr.Reset()
@@ -196,7 +198,7 @@ func TestServeExecuteStrictlyDecodesInvocationAndNormalizesResult(t *testing.T) 
 			&stderr,
 		)
 		if exit != ExitArguments || stderr.Len() == 0 {
-			t.Fatalf("strict decode %q exit=%d stderr=%q", malformed, exit, stderr.String())
+			t.Fatalf("strict decode len=%d exit=%d stderr=%q", len(malformed), exit, stderr.String())
 		}
 	}
 }
