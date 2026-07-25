@@ -3,22 +3,35 @@ package serversetup
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ohtoe02/ohtools-plugins/internal/execx"
 )
 
 type SystemBackend struct {
-	Root   string
-	Runner execx.Runner
+	Root       string
+	Runner     execx.Runner
+	HTTPClient HTTPDoer
+}
+
+type HTTPDoer interface {
+	Do(*http.Request) (*http.Response, error)
 }
 
 type managedFile struct {
@@ -178,6 +191,11 @@ func (backend SystemBackend) applyPackages(ctx context.Context, profile Profile)
 	if len(packages) == 0 {
 		return nil
 	}
+	if slices.Contains(profile.Items, ItemZabbix) {
+		if err := backend.installZabbixRepository(ctx, profile.Config); err != nil {
+			return err
+		}
+	}
 	environment := map[string]string{"DEBIAN_FRONTEND": "noninteractive"}
 	if _, err := backend.run(ctx, execx.Spec{
 		Program: "apt-get", Arguments: []string{"update"}, Environment: environment,
@@ -190,6 +208,105 @@ func (backend SystemBackend) applyPackages(ctx context.Context, profile Profile)
 		Program: "apt-get", Arguments: arguments, Environment: environment,
 	})
 	return err
+}
+
+func (backend SystemBackend) installZabbixRepository(ctx context.Context, config Config) error {
+	if config.Zabbix == nil || !config.Zabbix.Enabled {
+		return errors.New("zabbix repository metadata is unavailable")
+	}
+	client := backend.HTTPClient
+	if client == nil {
+		client = pinnedHTTPClient()
+	}
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		config.Zabbix.RepositoryPackageURL,
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Accept", "application/octet-stream")
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("download Zabbix repository package: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("download Zabbix repository package: HTTP %d", response.StatusCode)
+	}
+	if response.ContentLength >= 0 &&
+		response.ContentLength != config.Zabbix.RepositoryPackageSize {
+		return errors.New("Zabbix repository package size does not match")
+	}
+	content, err := io.ReadAll(io.LimitReader(
+		response.Body,
+		config.Zabbix.RepositoryPackageSize+1,
+	))
+	if err != nil {
+		return err
+	}
+	if int64(len(content)) != config.Zabbix.RepositoryPackageSize {
+		return errors.New("Zabbix repository package size does not match")
+	}
+	expected, err := hex.DecodeString(config.Zabbix.RepositoryPackageSHA256)
+	if err != nil {
+		return errors.New("Zabbix repository package SHA-256 is invalid")
+	}
+	actual := sha256.Sum256(content)
+	if subtle.ConstantTimeCompare(actual[:], expected) != 1 {
+		return errors.New("Zabbix repository package SHA-256 does not match")
+	}
+	directory := backend.path("/var/cache/ohtools/server-setup/downloads")
+	if err := secureMkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(directory, "zabbix-release-*.deb")
+	if err != nil {
+		return err
+	}
+	path := file.Name()
+	defer os.Remove(path)
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := file.Write(content); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	_, err = backend.run(ctx, execx.Spec{
+		Program: "dpkg", Arguments: []string{"--install", "--", path},
+	})
+	return err
+}
+
+func pinnedHTTPClient() *http.Client {
+	transport := &http.Transport{
+		Proxy:              nil,
+		DisableCompression: true,
+		TLSClientConfig:    &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+		CheckRedirect: func(request *http.Request, via []*http.Request) error {
+			if len(via) >= 3 || request.URL.Scheme != "https" ||
+				request.URL.Hostname() != "repo.zabbix.com" ||
+				request.URL.Port() != "" || request.URL.User != nil {
+				return errors.New("unsafe Zabbix repository redirect")
+			}
+			return nil
+		},
+	}
 }
 
 func desiredPackages(profile Profile) []string {
@@ -296,6 +413,9 @@ func (backend SystemBackend) installAuthorizedKeys(administrator Administrator) 
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() ||
 			info.Mode().Perm()&0o022 != 0 || info.Size() > 1<<20 {
 			return fmt.Errorf("authorized key source %s is unsafe", source)
+		}
+		if err := validateTrustedKeySource(source, info); err != nil {
+			return err
 		}
 		content, err := os.ReadFile(source) // #nosec G304 -- validated fixed config path.
 		if err != nil {

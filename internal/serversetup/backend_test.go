@@ -2,7 +2,11 @@ package serversetup
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -150,6 +154,63 @@ func TestSystemBackendUsesDirectPackageArgv(t *testing.T) {
 	}
 }
 
+func TestSystemBackendVerifiesPinnedZabbixRepositoryPackage(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("repo-pkg")
+	digest := fmt.Sprintf("%x", sha256.Sum256(content))
+	var calls []execx.Spec
+	backend := SystemBackend{
+		Root: t.TempDir(),
+		HTTPClient: httpDoerFunc(func(request *http.Request) (*http.Response, error) {
+			if request.URL.Scheme != "https" || request.URL.Host != "repo.zabbix.com" {
+				t.Fatalf("request URL = %s", request.URL)
+			}
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				ContentLength: int64(len(content)),
+				Body:          io.NopCloser(strings.NewReader(string(content))),
+				Header:        make(http.Header),
+			}, nil
+		}),
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			calls = append(calls, spec)
+			return execx.Output{}, nil
+		}),
+	}
+	config := DefaultConfig()
+	config.Zabbix = &ZabbixConfig{
+		Enabled: true, Server: "192.0.2.10", Hostname: "web-01",
+		RepositoryPackageURL:    "https://repo.zabbix.com/release.deb",
+		RepositoryPackageSize:   int64(len(content)),
+		RepositoryPackageSHA256: digest,
+	}
+	profile := Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemZabbix},
+	}
+	if err := backend.Apply(context.Background(), ItemPackages, profile); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 3 || calls[0].Program != "dpkg" ||
+		!reflect.DeepEqual(calls[0].Arguments[:2], []string{"--install", "--"}) ||
+		calls[1].Program != "apt-get" || calls[2].Program != "apt-get" {
+		t.Fatalf("calls = %#v", calls)
+	}
+
+	config.Zabbix.RepositoryPackageSHA256 = strings.Repeat("0", 64)
+	calls = nil
+	if err := backend.Apply(context.Background(), ItemPackages, Profile{
+		Platform: profile.Platform, Config: config, Items: profile.Items,
+	}); err == nil {
+		t.Fatal("digest mismatch was accepted")
+	}
+	if len(calls) != 0 {
+		t.Fatalf("commands ran after digest mismatch: %#v", calls)
+	}
+}
+
 func TestSystemBackendTreatsMissingPackagesAsDrift(t *testing.T) {
 	t.Parallel()
 
@@ -264,4 +325,10 @@ func successfulRunner() execx.Runner {
 	return execx.RunnerFunc(func(context.Context, execx.Spec) (execx.Output, error) {
 		return execx.Output{}, nil
 	})
+}
+
+type httpDoerFunc func(*http.Request) (*http.Response, error)
+
+func (function httpDoerFunc) Do(request *http.Request) (*http.Response, error) {
+	return function(request)
 }
