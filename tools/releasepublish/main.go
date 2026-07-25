@@ -39,10 +39,11 @@ var (
 )
 
 type publishOptions struct {
-	Repository string
-	Tag        string
-	Commit     string
-	Assets     []string
+	RegistryRoot string
+	Repository   string
+	Tag          string
+	Commit       string
+	Assets       []string
 }
 
 type releaseAsset struct {
@@ -103,17 +104,30 @@ func run(ctx context.Context, arguments []string, runner ghRunner) error {
 	if flags.NArg() != 0 {
 		return errors.New("releasepublish accepts only named arguments")
 	}
+	registryRoot, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("resolve plugin registry root: %w", err)
+	}
 	return publishRelease(ctx, runner, publishOptions{
-		Repository: *repository,
-		Tag:        *tag,
-		Commit:     *commit,
-		Assets:     assets,
+		RegistryRoot: registryRoot,
+		Repository:   *repository,
+		Tag:          *tag,
+		Commit:       *commit,
+		Assets:       assets,
 	})
 }
 
 func publishRelease(ctx context.Context, runner ghRunner, options publishOptions) error {
 	if err := validatePublishOptions(options); err != nil {
 		return err
+	}
+	registry, err := pluginregistry.Load(options.RegistryRoot)
+	if err != nil {
+		return fmt.Errorf("load canonical plugin registry: %w", err)
+	}
+	entry, version, err := registry.ResolveTag(options.Tag)
+	if err != nil {
+		return fmt.Errorf("resolve canonical plugin release: %w", err)
 	}
 	workspace, err := os.MkdirTemp("", "ohtools-release-publish-*")
 	if err != nil {
@@ -127,7 +141,7 @@ func publishRelease(ctx context.Context, runner ghRunner, options publishOptions
 	if err != nil {
 		return err
 	}
-	if err := validateStagedArtifactSet(options, assets); err != nil {
+	if err := validateStagedArtifactSet(options, entry, version, assets); err != nil {
 		return fmt.Errorf("validate staged release artifacts: %w", err)
 	}
 
@@ -261,13 +275,13 @@ func publishRelease(ctx context.Context, runner ghRunner, options publishOptions
 	return nil
 }
 
-func validateStagedArtifactSet(options publishOptions, assets []releaseAsset) error {
-	tagSeparator := strings.LastIndex(options.Tag, "-v")
-	if tagSeparator <= 0 || tagSeparator+2 >= len(options.Tag) {
-		return errors.New("release tag does not identify a plugin and version")
-	}
-	name := options.Tag[:tagSeparator]
-	version := options.Tag[tagSeparator+2:]
+func validateStagedArtifactSet(
+	options publishOptions,
+	entry pluginregistry.Entry,
+	version string,
+	assets []releaseAsset,
+) error {
+	name := entry.Name
 	binaryName := name + "_linux_amd64"
 	expectedNames := []string{
 		binaryName,
@@ -338,7 +352,9 @@ func validateStagedArtifactSet(options publishOptions, assets []releaseAsset) er
 	if err := protocol.ValidateManifest(manifest); err != nil {
 		return fmt.Errorf("validate manifest sidecar: %w", err)
 	}
-	if manifest.Name != name || manifest.Version != version {
+	if manifest.Name != entry.Name ||
+		manifest.Version != version ||
+		manifest.Description != entry.Description {
 		return errors.New("manifest sidecar identity does not match the release tag")
 	}
 
@@ -360,10 +376,11 @@ func validateStagedArtifactSet(options publishOptions, assets []releaseAsset) er
 		binaryName,
 	)
 	if metadata.SchemaVersion != "1" ||
-		metadata.Name != name ||
+		metadata.Name != entry.Name ||
 		metadata.Version != version ||
-		metadata.Description != manifest.Description ||
-		metadata.MinimumOhtoolsVersion == "" ||
+		metadata.Description != entry.Description ||
+		metadata.Homepage != entry.Homepage ||
+		metadata.MinimumOhtoolsVersion != entry.MinimumOhtoolsVersion ||
 		metadata.PublishedAt.IsZero() ||
 		metadata.Asset.OS != "linux" ||
 		metadata.Asset.Arch != "amd64" ||
@@ -450,6 +467,9 @@ func verifyPublishedRelease(
 }
 
 func validatePublishOptions(options publishOptions) error {
+	if strings.TrimSpace(options.RegistryRoot) == "" {
+		return errors.New("plugin registry root is required")
+	}
 	if !repositoryPattern.MatchString(options.Repository) {
 		return errors.New("repository must be an exact owner/name")
 	}

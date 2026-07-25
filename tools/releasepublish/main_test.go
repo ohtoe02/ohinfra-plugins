@@ -20,9 +20,11 @@ import (
 )
 
 const (
-	testRepository = "ohtoe02/ohtools-plugins"
-	testTag        = "system-base-v1.1.0"
-	testCommit     = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testRegistryRoot = "../.."
+	testRepository   = "ohtoe02/ohtools-plugins"
+	testTag          = "system-base-v1.1.0"
+	testCommit       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testDescription  = "Operating system information and health diagnostics for ohtools."
 )
 
 func TestPublishReleaseCreatesDraftWithAllAssetsBeforePublishing(t *testing.T) {
@@ -36,10 +38,11 @@ func TestPublishReleaseCreatesDraftWithAllAssetsBeforePublishing(t *testing.T) {
 		context.Background(),
 		github,
 		publishOptions{
-			Repository: testRepository,
-			Tag:        testTag,
-			Commit:     testCommit,
-			Assets:     assets,
+			RegistryRoot: testRegistryRoot,
+			Repository:   testRepository,
+			Tag:          testTag,
+			Commit:       testCommit,
+			Assets:       assets,
 		},
 	); err != nil {
 		t.Fatal(err)
@@ -84,10 +87,11 @@ func TestPublishReleaseAcceptsExactReleaseAfterPublishTransportAmbiguity(t *test
 		context.Background(),
 		github,
 		publishOptions{
-			Repository: testRepository,
-			Tag:        testTag,
-			Commit:     testCommit,
-			Assets:     assets,
+			RegistryRoot: testRegistryRoot,
+			Repository:   testRepository,
+			Tag:          testTag,
+			Commit:       testCommit,
+			Assets:       assets,
 		},
 	); err != nil {
 		t.Fatal(err)
@@ -121,10 +125,11 @@ func TestPublishReleaseRejectsAssetChangedDuringAmbiguousPublish(t *testing.T) {
 		context.Background(),
 		github,
 		publishOptions{
-			Repository: testRepository,
-			Tag:        testTag,
-			Commit:     testCommit,
-			Assets:     assets,
+			RegistryRoot: testRegistryRoot,
+			Repository:   testRepository,
+			Tag:          testTag,
+			Commit:       testCommit,
+			Assets:       assets,
 		},
 	)
 	if err == nil || !strings.Contains(err.Error(), "does not match local asset") {
@@ -153,10 +158,11 @@ func TestPublishReleaseResumesMatchingDraftAndUploadsOnlyMissingAssets(t *testin
 		context.Background(),
 		github,
 		publishOptions{
-			Repository: testRepository,
-			Tag:        testTag,
-			Commit:     testCommit,
-			Assets:     assets,
+			RegistryRoot: testRegistryRoot,
+			Repository:   testRepository,
+			Tag:          testTag,
+			Commit:       testCommit,
+			Assets:       assets,
 		},
 	); err != nil {
 		t.Fatal(err)
@@ -196,10 +202,11 @@ func TestPublishReleaseAcceptsExactAlreadyPublishedRelease(t *testing.T) {
 		context.Background(),
 		github,
 		publishOptions{
-			Repository: testRepository,
-			Tag:        testTag,
-			Commit:     testCommit,
-			Assets:     assets,
+			RegistryRoot: testRegistryRoot,
+			Repository:   testRepository,
+			Tag:          testTag,
+			Commit:       testCommit,
+			Assets:       assets,
 		},
 	); err != nil {
 		t.Fatal(err)
@@ -229,10 +236,11 @@ func TestPublishReleaseFailsClosedForIncompletePublishedRelease(t *testing.T) {
 		context.Background(),
 		github,
 		publishOptions{
-			Repository: testRepository,
-			Tag:        testTag,
-			Commit:     testCommit,
-			Assets:     assets,
+			RegistryRoot: testRegistryRoot,
+			Repository:   testRepository,
+			Tag:          testTag,
+			Commit:       testCommit,
+			Assets:       assets,
 		},
 	)
 	if err == nil {
@@ -284,10 +292,11 @@ func TestPublishReleaseFailsClosedForPublishedReleaseMismatch(t *testing.T) {
 				context.Background(),
 				github,
 				publishOptions{
-					Repository: testRepository,
-					Tag:        testTag,
-					Commit:     testCommit,
-					Assets:     assets,
+					RegistryRoot: testRegistryRoot,
+					Repository:   testRepository,
+					Tag:          testTag,
+					Commit:       testCommit,
+					Assets:       assets,
 				},
 			)
 			if err == nil {
@@ -317,10 +326,11 @@ func TestPublishReleaseFailsClosedForMismatchedDraftAsset(t *testing.T) {
 		context.Background(),
 		github,
 		publishOptions{
-			Repository: testRepository,
-			Tag:        testTag,
-			Commit:     testCommit,
-			Assets:     assets,
+			RegistryRoot: testRegistryRoot,
+			Repository:   testRepository,
+			Tag:          testTag,
+			Commit:       testCommit,
+			Assets:       assets,
 		},
 	)
 	if err == nil || !strings.Contains(err.Error(), "does not match local asset") {
@@ -346,10 +356,11 @@ func TestPublishReleaseFailsClosedForMismatchedDraftTarget(t *testing.T) {
 		context.Background(),
 		github,
 		publishOptions{
-			Repository: testRepository,
-			Tag:        testTag,
-			Commit:     testCommit,
-			Assets:     assets,
+			RegistryRoot: testRegistryRoot,
+			Repository:   testRepository,
+			Tag:          testTag,
+			Commit:       testCommit,
+			Assets:       assets,
 		},
 	)
 	if err == nil || !strings.Contains(err.Error(), "targets commit") {
@@ -377,10 +388,11 @@ func TestPublishReleaseFailsClosedForUnexpectedDraftAsset(t *testing.T) {
 		context.Background(),
 		github,
 		publishOptions{
-			Repository: testRepository,
-			Tag:        testTag,
-			Commit:     testCommit,
-			Assets:     assets,
+			RegistryRoot: testRegistryRoot,
+			Repository:   testRepository,
+			Tag:          testTag,
+			Commit:       testCommit,
+			Assets:       assets,
 		},
 	)
 	if err == nil || !strings.Contains(err.Error(), "unexpected asset") {
@@ -444,6 +456,26 @@ func TestPublishReleaseRejectsInconsistentStagedArtifactSetBeforeGitHubMutation(
 			},
 		},
 		{
+			name: "metadata homepage",
+			mutate: func(t *testing.T, assets []string) {
+				t.Helper()
+				var metadata pluginregistry.ReleaseMetadata
+				decodeTestJSON(t, assets[4], &metadata)
+				metadata.Homepage = "https://example.invalid/wrong"
+				writeJSONAsset(t, assets[4], metadata)
+			},
+		},
+		{
+			name: "metadata minimum host version",
+			mutate: func(t *testing.T, assets []string) {
+				t.Helper()
+				var metadata pluginregistry.ReleaseMetadata
+				decodeTestJSON(t, assets[4], &metadata)
+				metadata.MinimumOhtoolsVersion = "9.9.9"
+				writeJSONAsset(t, assets[4], metadata)
+			},
+		},
+		{
 			name: "raw invalid UTF-8 metadata",
 			mutate: func(t *testing.T, assets []string) {
 				t.Helper()
@@ -451,7 +483,7 @@ func TestPublishReleaseRejectsInconsistentStagedArtifactSetBeforeGitHubMutation(
 				if err != nil {
 					t.Fatal(err)
 				}
-				offset := bytes.Index(encoded, []byte("System diagnostics"))
+				offset := bytes.Index(encoded, []byte(testDescription))
 				if offset < 0 {
 					t.Fatal("metadata fixture does not contain description")
 				}
@@ -474,10 +506,11 @@ func TestPublishReleaseRejectsInconsistentStagedArtifactSetBeforeGitHubMutation(
 				context.Background(),
 				github,
 				publishOptions{
-					Repository: testRepository,
-					Tag:        testTag,
-					Commit:     testCommit,
-					Assets:     assets,
+					RegistryRoot: testRegistryRoot,
+					Repository:   testRepository,
+					Tag:          testTag,
+					Commit:       testCommit,
+					Assets:       assets,
 				},
 			)
 			if err == nil {
@@ -554,10 +587,11 @@ func TestPublishReleaseFailsClosedForRemoteTagCommitMismatch(t *testing.T) {
 		context.Background(),
 		github,
 		publishOptions{
-			Repository: testRepository,
-			Tag:        testTag,
-			Commit:     testCommit,
-			Assets:     assets,
+			RegistryRoot: testRegistryRoot,
+			Repository:   testRepository,
+			Tag:          testTag,
+			Commit:       testCommit,
+			Assets:       assets,
 		},
 	)
 	if err == nil || !strings.Contains(err.Error(), "remote tag commit") {
@@ -579,7 +613,7 @@ func writeTestAssets(t *testing.T) []string {
 		ProtocolVersion: protocol.ProtocolVersion,
 		Name:            "system-base",
 		Version:         "1.1.0",
-		Description:     "System diagnostics",
+		Description:     testDescription,
 		Commands: []protocol.Command{{
 			Path: []string{"system", "info"}, Use: "info", Short: "Show system information",
 			Category: protocol.CategoryDiagnostic, Arguments: []protocol.Argument{}, Flags: []protocol.Flag{},
@@ -588,7 +622,7 @@ func writeTestAssets(t *testing.T) []string {
 	metadata := pluginregistry.ReleaseMetadata{
 		SchemaVersion:         "1",
 		Name:                  "system-base",
-		Description:           "System diagnostics",
+		Description:           testDescription,
 		Homepage:              "https://github.com/ohtoe02/ohtools-plugins",
 		Version:               "1.1.0",
 		MinimumOhtoolsVersion: "0.3.2",
