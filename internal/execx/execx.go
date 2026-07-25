@@ -139,22 +139,19 @@ func (runner OSRunner) Run(ctx context.Context, spec Spec) (Output, error) {
 		return output, nil
 	case <-ctx.Done():
 		killErr := killCommand(command)
+		if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			killErr = fmt.Errorf("cleanup kill %s: %w", path, killErr)
+		} else {
+			killErr = nil
+		}
 		timer := time.NewTimer(processCleanupWait)
 		defer timer.Stop()
 		select {
 		case waitErr := <-done:
 			output := buildOutput(path, command, stdout, stderr, time.Since(started))
 			output.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
-			var exitError *exec.ExitError
-			if waitErr != nil && !errors.As(waitErr, &exitError) {
+			if waitErr != nil {
 				waitErr = fmt.Errorf("cleanup wait for %s: %w", path, waitErr)
-			} else {
-				waitErr = nil
-			}
-			if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
-				killErr = fmt.Errorf("cleanup kill %s: %w", path, killErr)
-			} else {
-				killErr = nil
 			}
 			return output, errors.Join(ctx.Err(), killErr, waitErr)
 		case <-timer.C:

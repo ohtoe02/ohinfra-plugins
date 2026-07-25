@@ -112,6 +112,32 @@ func TestRunnerStopsAtDeadlineAndReportsNonZeroExit(t *testing.T) {
 	}
 }
 
+func TestRunnerSurfacesLeaderCleanupResult(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows process cleanup has separate coverage")
+	}
+	program := copyTestExecutable(t)
+	runner := OSRunner{Resolver: Resolver{Directories: []string{filepath.Dir(program)}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := runner.Run(ctx, Spec{
+		Program: filepath.Base(program),
+		Environment: map[string]string{
+			"GO_WANT_EXECX_HELPER": "sleep",
+		},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runner error = %v", err)
+	}
+	if !strings.Contains(err.Error(), "cleanup wait") {
+		t.Fatalf("leader cleanup result was not surfaced: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("runner cleanup was unbounded: %s", elapsed)
+	}
+}
+
 func TestRunnerBoundsCleanupWhenDescendantKeepsProtocolPipesOpen(t *testing.T) {
 	program := copyTestExecutable(t)
 	runner := OSRunner{Resolver: Resolver{Directories: []string{filepath.Dir(program)}}}
