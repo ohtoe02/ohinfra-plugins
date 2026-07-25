@@ -1,0 +1,89 @@
+{
+  "schema_version": "1",
+  "cases": [
+    {
+      "name": "duplicate request id",
+      "phase": "plan",
+      "error_contains": "duplicate",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"one\",\"request_id\":\"two\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":{}}"
+    },
+    {
+      "name": "unknown top-level field",
+      "phase": "plan",
+      "error_contains": "unknown",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":{},\"unknown\":true}"
+    },
+    {
+      "name": "wrong option type",
+      "phase": "plan",
+      "error_contains": "wrong type",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":{\"count\":2.5}}"
+    },
+    {
+      "name": "unknown option",
+      "phase": "plan",
+      "error_contains": "unknown option",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":{\"other\":true}}"
+    },
+    {
+      "name": "missing required argument",
+      "phase": "plan",
+      "error_contains": "argument count",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[],\"options\":{}}"
+    },
+    {
+      "name": "malformed deadline",
+      "phase": "plan",
+      "error_contains": "deadline",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":{},\"deadline\":\"tomorrow\"}"
+    },
+    {
+      "name": "plan carries digest",
+      "phase": "plan",
+      "error_contains": "plan_digest",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":{},\"plan_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+    },
+    {
+      "name": "execute omits digest",
+      "phase": "execute",
+      "error_contains": "plan_digest",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":{}}"
+    },
+    {
+      "name": "null arguments",
+      "phase": "plan",
+      "error_contains": "must not be null",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":null,\"options\":{}}"
+    },
+    {
+      "name": "missing arguments",
+      "phase": "plan",
+      "error_contains": "missing",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"options\":{}}"
+    },
+    {
+      "name": "null options",
+      "phase": "plan",
+      "error_contains": "must not be null",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":null}"
+    },
+    {
+      "name": "missing options",
+      "phase": "plan",
+      "error_contains": "missing",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"]}"
+    },
+    {
+      "name": "malformed duration option",
+      "phase": "plan",
+      "error_contains": "wrong type",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":{\"timeout\":\"soon\"}}"
+    },
+    {
+      "name": "malformed execute digest",
+      "phase": "execute",
+      "error_contains": "plan_digest",
+      "canonical_json": "{\"protocol_version\":1,\"request_id\":\"request-1\",\"command_path\":[\"example\",\"apply\"],\"arguments\":[\"ssh\"],\"options\":{},\"plan_digest\":\"ABCDEF\"}"
+    }
+  ]
+}

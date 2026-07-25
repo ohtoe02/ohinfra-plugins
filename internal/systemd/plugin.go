@@ -30,14 +30,16 @@ func DefaultConfig() Config {
 }
 
 type Options struct {
-	Version    string
-	Commit     string
-	BuildDate  string
-	ConfigPath string
-	Runner     execx.Runner
-	Host       string
-	Now        func() time.Time
-	Sleep      func(context.Context, time.Duration) error
+	Version         string
+	Commit          string
+	BuildDate       string
+	ConfigPath      string
+	Runner          execx.Runner
+	Inspector       Inspector
+	MutationBackend MutationBackend
+	Host            string
+	Now             func() time.Time
+	Sleep           func(context.Context, time.Duration) error
 }
 
 func NewDefinition(options Options) protocol.Definition {
@@ -50,53 +52,66 @@ func NewDefinition(options Options) protocol.Definition {
 	if options.Runner == nil {
 		options.Runner = execx.OSRunner{Resolver: execx.SystemResolver()}
 	}
+	if options.Inspector == nil {
+		options.Inspector = commandInspector{runner: options.Runner}
+	}
+	if options.MutationBackend == nil {
+		options.MutationBackend = commandMutationBackend{runner: options.Runner}
+	}
 	if options.Host == "" {
 		options.Host, _ = os.Hostname()
 	}
-	manifest := protocol.Manifest{
-		ProtocolVersion: protocol.ProtocolVersion, Name: Name, Version: options.Version,
-		Description: Description,
-		Commands: []protocol.Command{
-			{
-				Path: []string{"service", "status"}, Use: "status <unit>", Short: "Show stable systemd unit properties",
-				Category:  protocol.CategoryDiagnostic,
+	return protocol.NewDefinition(
+		protocol.DefinitionSpec{Name: Name, Version: options.Version, Description: Description},
+		protocol.Diagnostic(protocol.CommandSpec{
+			Path: []string{"service", "status"}, Use: "status <unit>", Short: "Show stable systemd unit properties",
+			Arguments: []protocol.Argument{{Name: "unit", Description: "Systemd unit name", Required: true}},
+			Flags:     []protocol.Flag{},
+		}, func(ctx context.Context, invocation protocol.Invocation) (protocol.Result, error) {
+			return execute(ctx, invocation, options)
+		}),
+		protocol.Diagnostic(protocol.CommandSpec{
+			Path: []string{"service", "logs"}, Use: "logs <unit>", Short: "Show redacted systemd journal entries",
+			Arguments: []protocol.Argument{{Name: "unit", Description: "Systemd unit name", Required: true}},
+			Flags: []protocol.Flag{
+				{Name: "since", Type: "duration", Description: "Journal lookback duration", Default: "1h0m0s"},
+				{Name: "lines", Type: "int", Description: "Maximum journal lines", Default: 200},
+			},
+		}, func(ctx context.Context, invocation protocol.Invocation) (protocol.Result, error) {
+			return execute(ctx, invocation, options)
+		}),
+		protocol.Mutation(
+			protocol.CommandSpec{
+				Path: []string{"service", "restart"}, Use: "restart <unit>", Short: "Restart and verify a systemd unit",
 				Arguments: []protocol.Argument{{Name: "unit", Description: "Systemd unit name", Required: true}},
 				Flags:     []protocol.Flag{},
 			},
-			{
-				Path: []string{"service", "logs"}, Use: "logs <unit>", Short: "Show redacted systemd journal entries",
-				Category:  protocol.CategoryDiagnostic,
-				Arguments: []protocol.Argument{{Name: "unit", Description: "Systemd unit name", Required: true}},
-				Flags: []protocol.Flag{
-					{Name: "since", Type: "duration", Description: "Journal lookback duration", Default: "1h0m0s"},
-					{Name: "lines", Type: "int", Description: "Maximum journal lines", Default: 200},
-				},
+			protocol.CategoryOperational,
+			protocol.Risk{RequiresRoot: true, RequiresConfirmation: true},
+			func(ctx context.Context, invocation protocol.Invocation) (protocol.Plan, error) {
+				manager, _, err := managerFor(options)
+				if err != nil {
+					return protocol.Plan{}, err
+				}
+				unit, err := validateInvocation(invocation, "restart")
+				if err != nil {
+					return protocol.Plan{}, err
+				}
+				return (RestartPlanner{Inspector: manager.Inspector}).Plan(ctx, unit)
 			},
-			{
-				Path: []string{"service", "restart"}, Use: "restart <unit>", Short: "Restart and verify a systemd unit",
-				Category:  protocol.CategoryOperational,
-				Arguments: []protocol.Argument{{Name: "unit", Description: "Systemd unit name", Required: true}},
-				Flags:     []protocol.Flag{}, RequiresRoot: true, SupportsDryRun: true, RequiresConfirmation: true,
+			func(ctx context.Context, invocation protocol.Invocation, plan protocol.Plan) (protocol.Result, error) {
+				manager, _, err := managerFor(options)
+				if err != nil {
+					return protocol.Result{}, err
+				}
+				unit, err := validateInvocation(invocation, "restart")
+				if err != nil {
+					return protocol.Result{}, err
+				}
+				return manager.ExecuteRestart(ctx, unit, plan)
 			},
-		},
-	}
-	return protocol.Definition{
-		Manifest: manifest,
-		Plan: func(ctx context.Context, invocation protocol.Invocation) (protocol.Plan, error) {
-			manager, _, err := managerFor(options)
-			if err != nil {
-				return protocol.Plan{}, err
-			}
-			unit, err := validateInvocation(invocation, "restart")
-			if err != nil {
-				return protocol.Plan{}, err
-			}
-			return manager.RestartPlan(ctx, unit)
-		},
-		Execute: func(ctx context.Context, invocation protocol.Invocation) (protocol.Result, error) {
-			return execute(ctx, invocation, options)
-		},
-	}
+		),
+	)
 }
 
 func execute(ctx context.Context, invocation protocol.Invocation, options Options) (protocol.Result, error) {
@@ -121,25 +136,6 @@ func execute(ctx context.Context, invocation protocol.Invocation, options Option
 			return protocol.Result{}, protocol.ExitError{Code: protocol.ExitArguments, Err: err}
 		}
 		return manager.Logs(ctx, unit, since, lines), nil
-	case slices.Equal(invocation.CommandPath, []string{"service", "restart"}):
-		unit, err := validateInvocation(invocation, "restart")
-		if err != nil {
-			return protocol.Result{}, err
-		}
-		plan, err := manager.RestartPlan(ctx, unit)
-		if err != nil {
-			return protocol.Result{}, err
-		}
-		digest, err := protocol.PlanDigest(plan)
-		if err != nil {
-			return protocol.Result{}, err
-		}
-		if invocation.PlanDigest == "" || invocation.PlanDigest != digest {
-			return protocol.Result{}, protocol.ExitError{
-				Code: protocol.ExitArguments, Err: errors.New("approved plan digest does not match current plan"),
-			}
-		}
-		return manager.ExecuteRestart(ctx, unit, plan)
 	default:
 		return protocol.Result{}, protocol.ExitError{
 			Code: protocol.ExitArguments, Err: errors.New("unsupported systemd-base command"),
@@ -161,7 +157,7 @@ func managerFor(options Options) (Manager, Config, error) {
 		}
 	}
 	return Manager{
-		Runner: options.Runner, Host: options.Host,
+		Inspector: options.Inspector, MutationBackend: options.MutationBackend, Host: options.Host,
 		Tool: protocol.Tool{
 			Name: Name, Version: options.Version, Commit: options.Commit,
 			BuildDate: options.BuildDate, GoVersion: runtime.Version(), Architecture: runtime.GOARCH,

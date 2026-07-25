@@ -6,9 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"unicode/utf8"
 )
 
 func Decode(encoded []byte, target any) error {
+	if !utf8.Valid(encoded) {
+		return errors.New("JSON document must be valid UTF-8")
+	}
 	if err := rejectDuplicateKeys(encoded); err != nil {
 		return err
 	}

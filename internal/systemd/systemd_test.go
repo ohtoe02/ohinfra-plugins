@@ -95,6 +95,95 @@ func TestRestartRejectsUnapprovedPlanDigest(t *testing.T) {
 	}
 }
 
+func TestRestartPlannerUsesOnlyReadOnlyInspection(t *testing.T) {
+	inspector := &inspectorSpy{}
+	mutation := &mutationBackendSpy{}
+	definition := NewDefinition(Options{
+		ConfigPath: filepath.Join(t.TempDir(), "missing.yaml"),
+		Inspector:  inspector, MutationBackend: mutation,
+	})
+	if _, err := definition.Plan(context.Background(), invocation("restart", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if inspector.showCalls != 1 {
+		t.Fatalf("planner inspection calls = %d, want 1", inspector.showCalls)
+	}
+	if mutation.restartCalls != 0 || mutation.isActiveCalls != 0 {
+		t.Fatalf("planner reached mutation backend: %#v", mutation)
+	}
+}
+
+func TestRestartPlannerLeavesProtocolIdentityAndRiskToRegistry(t *testing.T) {
+	plan, err := (RestartPlanner{Inspector: &inspectorSpy{}}).Plan(
+		context.Background(),
+		"nginx.service",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.CommandID != "" || plan.RequiresRoot || plan.RequiresForce || plan.RequiresConfirmation {
+		t.Fatalf("domain planner supplied protocol-owned fields: %#v", plan)
+	}
+}
+
+func TestRestartDiagnosticLogsDoNotInventALookbackWindow(t *testing.T) {
+	var captured execx.Spec
+	inspector := commandInspector{runner: execx.RunnerFunc(
+		func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			captured = spec
+			return execx.Output{}, nil
+		},
+	)}
+	if _, err := inspector.Logs(context.Background(), "nginx.service", 0, 50); err != nil {
+		t.Fatal(err)
+	}
+	for _, argument := range captured.Arguments {
+		if strings.HasPrefix(argument, "--since=") {
+			t.Fatalf("restart diagnostics changed their historical scope: %#v", captured.Arguments)
+		}
+	}
+}
+
+type inspectorSpy struct {
+	showCalls int
+	logCalls  int
+}
+
+func (inspector *inspectorSpy) Show(
+	context.Context,
+	string,
+) (map[string]string, execx.Output, error) {
+	inspector.showCalls++
+	return map[string]string{
+		"Id": "nginx.service", "ActiveState": "active",
+	}, execx.Output{}, nil
+}
+
+func (inspector *inspectorSpy) Logs(
+	context.Context,
+	string,
+	time.Duration,
+	int,
+) (execx.Output, error) {
+	inspector.logCalls++
+	return execx.Output{}, nil
+}
+
+type mutationBackendSpy struct {
+	restartCalls  int
+	isActiveCalls int
+}
+
+func (backend *mutationBackendSpy) Restart(context.Context, string) (execx.Output, error) {
+	backend.restartCalls++
+	return execx.Output{}, nil
+}
+
+func (backend *mutationBackendSpy) IsActive(context.Context, string) (execx.Output, error) {
+	backend.isActiveCalls++
+	return execx.Output{}, nil
+}
+
 func invocation(command string, options map[string]any) protocol.Invocation {
 	if options == nil {
 		options = map[string]any{}

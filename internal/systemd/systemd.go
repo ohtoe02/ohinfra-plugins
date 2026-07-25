@@ -16,13 +16,36 @@ import (
 
 var unitName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,254}$`)
 
+type Inspector interface {
+	Show(context.Context, string) (map[string]string, execx.Output, error)
+	Logs(context.Context, string, time.Duration, int) (execx.Output, error)
+}
+
+type MutationBackend interface {
+	Restart(context.Context, string) (execx.Output, error)
+	IsActive(context.Context, string) (execx.Output, error)
+}
+
+type RestartPlanner struct {
+	Inspector Inspector
+}
+
 type Manager struct {
-	Runner        execx.Runner
-	Host          string
-	Tool          protocol.Tool
-	Now           func() time.Time
-	VerifyTimeout time.Duration
-	Sleep         func(context.Context, time.Duration) error
+	Inspector       Inspector
+	MutationBackend MutationBackend
+	Host            string
+	Tool            protocol.Tool
+	Now             func() time.Time
+	VerifyTimeout   time.Duration
+	Sleep           func(context.Context, time.Duration) error
+}
+
+type commandInspector struct {
+	runner execx.Runner
+}
+
+type commandMutationBackend struct {
+	runner execx.Runner
 }
 
 func ValidateUnit(unit string) error {
@@ -38,7 +61,7 @@ func (manager Manager) Status(ctx context.Context, unit string) protocol.Result 
 	if err := ValidateUnit(unit); err != nil {
 		return manager.failure("service status", started, protocol.ErrorArguments, "invalid_unit", err)
 	}
-	properties, output, err := manager.show(ctx, unit)
+	properties, output, err := manager.inspectShow(ctx, unit)
 	if err != nil {
 		return manager.commandFailure("service status", started, "systemctl", err)
 	}
@@ -63,9 +86,7 @@ func (manager Manager) Logs(ctx context.Context, unit string, since time.Duratio
 		return manager.failure("service logs", started, protocol.ErrorArguments, "invalid_log_range",
 			errors.New("since must be positive and lines must be within 1..100000"))
 	}
-	output, err := manager.run(ctx, "journalctl",
-		"--unit="+unit, "--since=-"+since.String(), "--lines="+strconv.Itoa(lines),
-		"--no-pager", "--output=short-iso-precise")
+	output, err := manager.inspectLogs(ctx, unit, since, lines)
 	if err != nil {
 		return manager.commandFailure("service logs", started, "journalctl", err)
 	}
@@ -84,11 +105,14 @@ func (manager Manager) Logs(ctx context.Context, unit string, since time.Duratio
 	})
 }
 
-func (manager Manager) RestartPlan(ctx context.Context, unit string) (protocol.Plan, error) {
+func (planner RestartPlanner) Plan(ctx context.Context, unit string) (protocol.Plan, error) {
 	if err := ValidateUnit(unit); err != nil {
 		return protocol.Plan{}, err
 	}
-	properties, output, err := manager.show(ctx, unit)
+	if planner.Inspector == nil {
+		return protocol.Plan{}, execx.ErrNotFound
+	}
+	properties, output, err := planner.Inspector.Show(ctx, unit)
 	if err != nil {
 		return protocol.Plan{}, err
 	}
@@ -97,9 +121,7 @@ func (manager Manager) RestartPlan(ctx context.Context, unit string) (protocol.P
 			output.ExitCode, strings.TrimSpace(string(output.Stderr)))
 	}
 	return protocol.Plan{
-		CommandID:    "service.restart",
-		Summary:      fmt.Sprintf("Restart %s and verify that it becomes active?", unit),
-		RequiresRoot: true, RequiresConfirmation: true,
+		Summary: fmt.Sprintf("Restart %s and verify that it becomes active?", unit),
 		Checks: []protocol.Check{{
 			ID: "current-state", Status: protocol.StatusInfo,
 			Summary: fmt.Sprintf("%s is %s", unit, properties["ActiveState"]),
@@ -112,7 +134,10 @@ func (manager Manager) RestartPlan(ctx context.Context, unit string) (protocol.P
 
 func (manager Manager) ExecuteRestart(ctx context.Context, unit string, plan protocol.Plan) (protocol.Result, error) {
 	started := time.Now()
-	output, err := manager.run(ctx, "systemctl", "restart", "--", unit)
+	if manager.MutationBackend == nil {
+		return protocol.Result{}, execx.ErrNotFound
+	}
+	output, err := manager.MutationBackend.Restart(ctx, unit)
 	if err != nil {
 		return protocol.Result{}, err
 	}
@@ -127,7 +152,7 @@ func (manager Manager) ExecuteRestart(ctx context.Context, unit string, plan pro
 	verifyContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	for {
-		verified, err := manager.run(verifyContext, "systemctl", "is-active", "--quiet", "--", unit)
+		verified, err := manager.MutationBackend.IsActive(verifyContext, unit)
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			return protocol.Result{}, err
 		}
@@ -161,14 +186,13 @@ func (manager Manager) restartFailure(
 	failure error,
 ) protocol.Result {
 	diagnostics := map[string]any{}
-	if properties, output, err := manager.show(ctx, unit); err == nil {
+	if properties, output, err := manager.inspectShow(ctx, unit); err == nil {
 		diagnostics["properties"] = properties
 		if output.ExitCode != 0 {
 			diagnostics["show_error"] = redact.String(string(output.Stderr))
 		}
 	}
-	if logs, err := manager.run(ctx, "journalctl", "--unit="+unit, "--lines=50",
-		"--no-pager", "--output=short-iso-precise"); err == nil {
+	if logs, err := manager.inspectLogs(ctx, unit, 0, 50); err == nil {
 		diagnostics["journal"] = redact.String(string(logs.Stdout))
 	}
 	return redact.Result(protocol.Normalize(protocol.Result{
@@ -181,8 +205,11 @@ func (manager Manager) restartFailure(
 	}))
 }
 
-func (manager Manager) show(ctx context.Context, unit string) (map[string]string, execx.Output, error) {
-	output, err := manager.run(ctx, "systemctl", "show", "--no-pager",
+func (inspector commandInspector) Show(
+	ctx context.Context,
+	unit string,
+) (map[string]string, execx.Output, error) {
+	output, err := runCommand(inspector.runner, ctx, "systemctl", "show", "--no-pager",
 		"--property=Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ExecMainStartTimestamp", "--", unit)
 	if err != nil {
 		return nil, output, err
@@ -197,13 +224,63 @@ func (manager Manager) show(ctx context.Context, unit string) (map[string]string
 	return properties, output, nil
 }
 
-func (manager Manager) run(ctx context.Context, program string, arguments ...string) (execx.Output, error) {
-	if manager.Runner == nil {
+func (inspector commandInspector) Logs(
+	ctx context.Context,
+	unit string,
+	since time.Duration,
+	lines int,
+) (execx.Output, error) {
+	arguments := []string{"--unit=" + unit}
+	if since > 0 {
+		arguments = append(arguments, "--since=-"+since.String())
+	}
+	arguments = append(arguments,
+		"--lines="+strconv.Itoa(lines), "--no-pager", "--output=short-iso-precise")
+	return runCommand(inspector.runner, ctx, "journalctl", arguments...)
+}
+
+func (backend commandMutationBackend) Restart(ctx context.Context, unit string) (execx.Output, error) {
+	return runCommand(backend.runner, ctx, "systemctl", "restart", "--", unit)
+}
+
+func (backend commandMutationBackend) IsActive(ctx context.Context, unit string) (execx.Output, error) {
+	return runCommand(backend.runner, ctx, "systemctl", "is-active", "--quiet", "--", unit)
+}
+
+func runCommand(
+	runner execx.Runner,
+	ctx context.Context,
+	program string,
+	arguments ...string,
+) (execx.Output, error) {
+	if runner == nil {
 		return execx.Output{}, execx.ErrNotFound
 	}
-	return manager.Runner.Run(ctx, execx.Spec{
+	return runner.Run(ctx, execx.Spec{
 		Program: program, Arguments: arguments, StdoutLimit: 10 << 20, StderrLimit: 1 << 20,
 	})
+}
+
+func (manager Manager) inspectShow(
+	ctx context.Context,
+	unit string,
+) (map[string]string, execx.Output, error) {
+	if manager.Inspector == nil {
+		return nil, execx.Output{}, execx.ErrNotFound
+	}
+	return manager.Inspector.Show(ctx, unit)
+}
+
+func (manager Manager) inspectLogs(
+	ctx context.Context,
+	unit string,
+	since time.Duration,
+	lines int,
+) (execx.Output, error) {
+	if manager.Inspector == nil {
+		return execx.Output{}, execx.ErrNotFound
+	}
+	return manager.Inspector.Logs(ctx, unit, since, lines)
 }
 
 func (manager Manager) commandFailure(command string, started time.Time, dependency string, err error) protocol.Result {

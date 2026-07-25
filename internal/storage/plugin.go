@@ -50,28 +50,20 @@ func NewDefinition(options Options) protocol.Definition {
 	if options.Collector.MountInfoPath == "" {
 		options.Collector = DefaultCollector()
 	}
-	manifest := protocol.Manifest{
-		ProtocolVersion: protocol.ProtocolVersion,
-		Name:            Name,
-		Version:         options.Version,
-		Description:     Description,
-		Commands: []protocol.Command{{
-			Path:     []string{"disk", "usage"},
-			Use:      "usage [path]",
-			Short:    "Show filesystem usage",
-			Category: protocol.CategoryDiagnostic,
+	return protocol.NewDefinition(
+		protocol.DefinitionSpec{Name: Name, Version: options.Version, Description: Description},
+		protocol.Diagnostic(protocol.CommandSpec{
+			Path:  []string{"disk", "usage"},
+			Use:   "usage [path]",
+			Short: "Show filesystem usage",
 			Arguments: []protocol.Argument{{
 				Name: "path", Description: "Path used to select a filesystem",
 			}},
 			Flags: []protocol.Flag{},
-		}},
-	}
-	return protocol.Definition{
-		Manifest: manifest,
-		Execute: func(ctx context.Context, invocation protocol.Invocation) (protocol.Result, error) {
+		}, func(ctx context.Context, invocation protocol.Invocation) (protocol.Result, error) {
 			return execute(ctx, invocation, options)
-		},
-	}
+		}),
+	)
 }
 
 func execute(ctx context.Context, invocation protocol.Invocation, options Options) (protocol.Result, error) {
