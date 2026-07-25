@@ -38,6 +38,11 @@ func TestPublishReleaseCreatesDraftWithAllAssetsBeforePublishing(t *testing.T) {
 	if github.draft || !github.releaseExists {
 		t.Fatalf("release exists=%t draft=%t", github.releaseExists, github.draft)
 	}
+	for _, asset := range assets {
+		if github.publishedDownloads[filepath.Base(asset)] == 0 {
+			t.Fatalf("published asset %q was not byte-verified", filepath.Base(asset))
+		}
+	}
 	if got, want := github.createAssets, assetNames(assets); !equalStrings(got, want) {
 		t.Fatalf("create assets=%v want=%v", got, want)
 	}
@@ -54,6 +59,67 @@ func TestPublishReleaseCreatesDraftWithAllAssetsBeforePublishing(t *testing.T) {
 	}
 	if len(github.uploadAssets) != 0 {
 		t.Fatalf("new release used a follow-up upload: %v", github.uploadAssets)
+	}
+}
+
+func TestPublishReleaseAcceptsExactReleaseAfterPublishTransportAmbiguity(t *testing.T) {
+	assets := writeTestAssets(t)
+	github := &fakeGitHub{
+		remoteCommit:      testCommit,
+		assets:            map[string][]byte{},
+		editResultErr:     errors.New("transport closed after publish"),
+		editResultApplied: true,
+	}
+
+	if err := publishRelease(
+		context.Background(),
+		github,
+		publishOptions{
+			Repository: testRepository,
+			Tag:        testTag,
+			Commit:     testCommit,
+			Assets:     assets,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if github.draft || !github.releaseExists {
+		t.Fatalf("release exists=%t draft=%t", github.releaseExists, github.draft)
+	}
+	for _, asset := range assets {
+		if github.publishedDownloads[filepath.Base(asset)] == 0 {
+			t.Fatalf(
+				"published asset %q was not reverified after ambiguous publish",
+				filepath.Base(asset),
+			)
+		}
+	}
+}
+
+func TestPublishReleaseRejectsAssetChangedDuringAmbiguousPublish(t *testing.T) {
+	assets := writeTestAssets(t)
+	github := &fakeGitHub{
+		remoteCommit:      testCommit,
+		assets:            map[string][]byte{},
+		editResultErr:     errors.New("transport closed after publish"),
+		editResultApplied: true,
+		publishedMutations: map[string][]byte{
+			"system-base_linux_amd64": []byte("different published bytes"),
+		},
+	}
+
+	err := publishRelease(
+		context.Background(),
+		github,
+		publishOptions{
+			Repository: testRepository,
+			Tag:        testTag,
+			Commit:     testCommit,
+			Assets:     assets,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "does not match local asset") {
+		t.Fatalf("ambiguous mismatched publish error=%v", err)
 	}
 }
 
@@ -98,7 +164,48 @@ func TestPublishReleaseResumesMatchingDraftAndUploadsOnlyMissingAssets(t *testin
 	}
 }
 
-func TestPublishReleaseFailsClosedForPublishedRelease(t *testing.T) {
+func TestPublishReleaseAcceptsExactAlreadyPublishedRelease(t *testing.T) {
+	assets := writeTestAssets(t)
+	remoteAssets := map[string][]byte{}
+	for _, asset := range assets {
+		content, err := os.ReadFile(asset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		remoteAssets[filepath.Base(asset)] = content
+	}
+	github := &fakeGitHub{
+		remoteCommit:  testCommit,
+		releaseExists: true,
+		draft:         false,
+		tag:           testTag,
+		targetCommit:  testCommit,
+		assets:        remoteAssets,
+	}
+
+	if err := publishRelease(
+		context.Background(),
+		github,
+		publishOptions{
+			Repository: testRepository,
+			Tag:        testTag,
+			Commit:     testCommit,
+			Assets:     assets,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if github.editCalls != 0 || len(github.uploadAssets) != 0 {
+		t.Fatal("already-published release was mutated")
+	}
+	for _, asset := range assets {
+		if github.publishedDownloads[filepath.Base(asset)] == 0 {
+			t.Fatalf("published asset %q was not byte-verified", filepath.Base(asset))
+		}
+	}
+}
+
+func TestPublishReleaseFailsClosedForIncompletePublishedRelease(t *testing.T) {
 	assets := writeTestAssets(t)
 	github := &fakeGitHub{
 		remoteCommit:  testCommit,
@@ -119,11 +226,68 @@ func TestPublishReleaseFailsClosedForPublishedRelease(t *testing.T) {
 			Assets:     assets,
 		},
 	)
-	if err == nil || !strings.Contains(err.Error(), "published release already exists") {
-		t.Fatalf("published release error=%v", err)
+	if err == nil {
+		t.Fatal("incomplete published release was accepted")
 	}
 	if len(github.uploadAssets) != 0 || github.editCalls != 0 {
 		t.Fatal("published release was mutated")
+	}
+}
+
+func TestPublishReleaseFailsClosedForPublishedReleaseMismatch(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string][]byte, *fakeGitHub)
+	}{
+		{
+			name: "target commit",
+			mutate: func(_ map[string][]byte, github *fakeGitHub) {
+				github.targetCommit = strings.Repeat("b", 40)
+			},
+		},
+		{
+			name: "asset bytes",
+			mutate: func(remote map[string][]byte, _ *fakeGitHub) {
+				remote["system-base_linux_amd64"] = []byte("different bytes")
+			},
+		},
+		{
+			name: "unexpected asset",
+			mutate: func(remote map[string][]byte, _ *fakeGitHub) {
+				remote["unexpected.txt"] = []byte("unexpected")
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assets := writeTestAssets(t)
+			remoteAssets := readTestAssets(t, assets)
+			github := &fakeGitHub{
+				remoteCommit:  testCommit,
+				releaseExists: true,
+				draft:         false,
+				tag:           testTag,
+				targetCommit:  testCommit,
+				assets:        remoteAssets,
+			}
+			test.mutate(remoteAssets, github)
+
+			err := publishRelease(
+				context.Background(),
+				github,
+				publishOptions{
+					Repository: testRepository,
+					Tag:        testTag,
+					Commit:     testCommit,
+					Assets:     assets,
+				},
+			)
+			if err == nil {
+				t.Fatal("mismatched published release was accepted")
+			}
+			if github.editCalls != 0 || len(github.uploadAssets) != 0 {
+				t.Fatal("mismatched published release was mutated")
+			}
+		})
 	}
 }
 
@@ -258,6 +422,19 @@ func writeTestAssets(t *testing.T) []string {
 	return assets
 }
 
+func readTestAssets(t *testing.T, paths []string) map[string][]byte {
+	t.Helper()
+	assets := make(map[string][]byte, len(paths))
+	for _, path := range paths {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assets[filepath.Base(path)] = content
+	}
+	return assets
+}
+
 func assetNames(paths []string) []string {
 	names := make([]string, 0, len(paths))
 	for _, path := range paths {
@@ -279,23 +456,30 @@ func equalStrings(left, right []string) bool {
 }
 
 type fakeGitHub struct {
-	remoteCommit    string
-	releaseExists   bool
-	draft           bool
-	tag             string
-	targetCommit    string
-	assets          map[string][]byte
-	createArguments []string
-	createAssets    []string
-	uploadAssets    []string
-	downloads       map[string]int
-	createCalls     int
-	editCalls       int
+	remoteCommit       string
+	releaseExists      bool
+	draft              bool
+	tag                string
+	targetCommit       string
+	assets             map[string][]byte
+	createArguments    []string
+	createAssets       []string
+	uploadAssets       []string
+	downloads          map[string]int
+	publishedDownloads map[string]int
+	createCalls        int
+	editCalls          int
+	editResultErr      error
+	editResultApplied  bool
+	publishedMutations map[string][]byte
 }
 
 func (github *fakeGitHub) Run(_ context.Context, arguments ...string) ([]byte, error) {
 	if github.downloads == nil {
 		github.downloads = map[string]int{}
+	}
+	if github.publishedDownloads == nil {
+		github.publishedDownloads = map[string]int{}
 	}
 	switch {
 	case len(arguments) >= 2 && arguments[0] == "api":
@@ -346,6 +530,9 @@ func (github *fakeGitHub) Run(_ context.Context, arguments ...string) ([]byte, e
 			return nil, err
 		}
 		github.downloads[name]++
+		if !github.draft {
+			github.publishedDownloads[name]++
+		}
 		return nil, nil
 	case commandMatches(arguments, "release", "upload"):
 		if containsArgument(arguments, "--clobber") {
@@ -366,8 +553,13 @@ func (github *fakeGitHub) Run(_ context.Context, arguments ...string) ([]byte, e
 		return nil, nil
 	case commandMatches(arguments, "release", "edit"):
 		github.editCalls++
-		github.draft = false
-		return nil, nil
+		if github.editResultErr == nil || github.editResultApplied {
+			github.draft = false
+			for name, content := range github.publishedMutations {
+				github.assets[name] = content
+			}
+		}
+		return nil, github.editResultErr
 	default:
 		return nil, errors.New("unexpected gh command: " + strings.Join(arguments, " "))
 	}
