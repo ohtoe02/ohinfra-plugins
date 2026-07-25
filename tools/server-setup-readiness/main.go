@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/ohtoe02/ohtools-plugins/internal/serversetupreadiness"
 )
@@ -20,6 +21,15 @@ func main() {
 }
 
 func run() (returnErr error) {
+	if len(os.Args) == 3 && os.Args[1] == "binary-smoke" {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		report, err := serversetupreadiness.RunBinarySmoke(ctx, os.Args[2])
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(report)
+	}
 	if len(os.Args) == 5 && os.Args[1] == "verify-report" {
 		content, err := os.ReadFile(os.Args[2])
 		if err != nil {
@@ -41,7 +51,10 @@ func run() (returnErr error) {
 		return serversetupreadiness.ValidateReport(report, os.Args[3], os.Args[4])
 	}
 	if len(os.Args) != 1 {
-		return errors.New("usage: server-setup-readiness [verify-report <path> <id> <version>]")
+		return errors.New(
+			"usage: server-setup-readiness [binary-smoke <plugin> | " +
+				"verify-report <path> <id> <version>]",
+		)
 	}
 	osRelease, err := os.ReadFile("/etc/os-release")
 	if err != nil {

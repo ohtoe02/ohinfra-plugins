@@ -35,6 +35,16 @@ type Backend interface {
 	Verify(context.Context, Item, Profile) error
 }
 
+type ApprovedObservation struct {
+	Details map[string]any
+}
+
+type ApprovedApplyBackend interface {
+	ApplyApproved(context.Context, Item, Profile, ApprovedObservation) error
+}
+
+var ErrApprovedStateChanged = errors.New("approved setup state changed")
+
 type DesiredStateMaterialProvider interface {
 	PrepareDesiredState(context.Context, *Profile) (map[string]string, error)
 }
@@ -217,8 +227,25 @@ func (manager Manager) Apply(ctx context.Context, approved protocol.Plan) (proto
 		if _, err := ExpandItems([]string{string(item)}, manager.Config); err != nil {
 			return protocol.Result{}, protocol.ExitError{Code: protocol.ExitArguments, Err: err}
 		}
-		if err := manager.Backend.Apply(ctx, item, profile); err != nil {
-			return manager.failure(started, item, "setup_apply_failed", err, completed), nil
+		var applyErr error
+		if backend, ok := manager.Backend.(ApprovedApplyBackend); ok {
+			observation, err := approvedObservation(approved, item)
+			if err != nil {
+				return protocol.Result{}, protocol.ExitError{
+					Code: protocol.ExitArguments,
+					Err:  err,
+				}
+			}
+			applyErr = backend.ApplyApproved(ctx, item, profile, observation)
+		} else {
+			applyErr = manager.Backend.Apply(ctx, item, profile)
+		}
+		if applyErr != nil {
+			code := "setup_apply_failed"
+			if errors.Is(applyErr, ErrApprovedStateChanged) {
+				code = "setup_plan_stale"
+			}
+			return manager.failure(started, item, code, applyErr, completed), nil
 		}
 		if err := manager.Backend.Verify(ctx, item, profile); err != nil {
 			return manager.failure(started, item, "setup_verify_failed", err, completed), nil
@@ -240,6 +267,22 @@ func (manager Manager) Apply(ctx context.Context, approved protocol.Plan) (proto
 		},
 		Changes: completed,
 	}), nil
+}
+
+func approvedObservation(
+	plan protocol.Plan,
+	item Item,
+) (ApprovedObservation, error) {
+	expectedID := "setup:" + string(item)
+	for _, check := range plan.Checks {
+		if check.ID == expectedID {
+			return ApprovedObservation{Details: check.Details}, nil
+		}
+	}
+	return ApprovedObservation{}, fmt.Errorf(
+		"approved setup plan is missing check %q",
+		expectedID,
+	)
 }
 
 func planItems(plan protocol.Plan) ([]Item, error) {

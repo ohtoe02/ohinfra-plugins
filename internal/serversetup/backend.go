@@ -169,9 +169,27 @@ func (backend SystemBackend) Apply(
 	item Item,
 	profile Profile,
 ) error {
+	return backend.apply(ctx, item, profile, nil)
+}
+
+func (backend SystemBackend) ApplyApproved(
+	ctx context.Context,
+	item Item,
+	profile Profile,
+	approved ApprovedObservation,
+) error {
+	return backend.apply(ctx, item, profile, &approved)
+}
+
+func (backend SystemBackend) apply(
+	ctx context.Context,
+	item Item,
+	profile Profile,
+	approved *ApprovedObservation,
+) error {
 	switch item {
 	case ItemPackages:
-		return backend.applyPackages(ctx, profile)
+		return backend.applyPackages(ctx, profile, approved)
 	case ItemUsers:
 		return backend.applyUsers(ctx, profile)
 	case ItemSSH:
@@ -187,7 +205,9 @@ func (backend SystemBackend) Apply(
 			return nil
 		}
 		if err := backend.recoverManagedTransaction(
+			ctx,
 			backend.path(managed.Path),
+			managed.Activation,
 		); err != nil {
 			return err
 		}
@@ -780,6 +800,13 @@ func (backend SystemBackend) applyFirewall(
 	snapshots := make([]fileSnapshot, 0, len(files))
 	unitChanged := false
 	for _, managed := range files {
+		if err := backend.recoverManagedTransaction(
+			ctx,
+			backend.path(managed.Path),
+			managed.Activation,
+		); err != nil {
+			return err
+		}
 		snapshot, err := backend.captureFileSnapshot(backend.path(managed.Path))
 		if err != nil {
 			return err
@@ -1002,9 +1029,10 @@ func rejectForeignInputBaseChains(input []byte) error {
 	var ruleset struct {
 		NFTables []struct {
 			Chain *struct {
-				Table string `json:"table"`
-				Name  string `json:"name"`
-				Hook  string `json:"hook"`
+				Family string `json:"family"`
+				Table  string `json:"table"`
+				Name   string `json:"name"`
+				Hook   string `json:"hook"`
 			} `json:"chain"`
 		} `json:"nftables"`
 	}
@@ -1016,9 +1044,11 @@ func rejectForeignInputBaseChains(input []byte) error {
 	}
 	for _, object := range ruleset.NFTables {
 		if object.Chain != nil && object.Chain.Hook == "input" &&
-			object.Chain.Table != "ohtools_server_setup" {
+			(object.Chain.Family != "inet" ||
+				object.Chain.Table != "ohtools_server_setup") {
 			return fmt.Errorf(
-				"foreign nftables input base chain %s/%s can block the managed SSH port",
+				"foreign nftables input base chain %s/%s/%s can block the managed SSH port",
+				object.Chain.Family,
 				object.Chain.Table,
 				object.Chain.Name,
 			)
@@ -1032,7 +1062,6 @@ func (backend SystemBackend) firewallFiles(profile Profile) ([]managedFile, erro
 	if err != nil {
 		return nil, err
 	}
-	rules.Activation = nil
 	service := managedFile{
 		Path: "/etc/systemd/system/ohtools-server-setup-firewall.service",
 		Mode: 0o644,
@@ -1412,21 +1441,14 @@ func (backend SystemBackend) observePackages(
 	}, nil
 }
 
-func (backend SystemBackend) applyPackages(ctx context.Context, profile Profile) error {
+func (backend SystemBackend) applyPackages(
+	ctx context.Context,
+	profile Profile,
+	approved *ApprovedObservation,
+) error {
 	packages := desiredPackages(profile)
 	if len(packages) == 0 {
 		return nil
-	}
-	if slices.Contains(profile.Items, ItemZabbix) {
-		installed, err := backend.packageInstalled(ctx, "zabbix-release")
-		if err != nil {
-			return err
-		}
-		if !installed {
-			if err := backend.installZabbixRepository(ctx, profile.Config); err != nil {
-				return err
-			}
-		}
 	}
 	observation, err := backend.observePackages(ctx, profile)
 	if err != nil {
@@ -1436,21 +1458,50 @@ func (backend SystemBackend) applyPackages(ctx context.Context, profile Profile)
 	if !ok {
 		return errors.New("package observation did not return an exact missing set")
 	}
+	if approved != nil {
+		expected, err := approvedMissingPackages(approved.Details)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(missing, expected) {
+			return fmt.Errorf(
+				"%w: approved missing packages %v, current %v",
+				ErrApprovedStateChanged,
+				expected,
+				missing,
+			)
+		}
+	}
 	if len(missing) == 0 {
 		return nil
 	}
-	environment := map[string]string{"DEBIAN_FRONTEND": "noninteractive"}
-	if _, err := backend.run(ctx, execx.Spec{
-		Program: "apt-get", Arguments: []string{"update"}, Environment: environment,
-	}); err != nil {
-		return err
+	installTargets := append([]string(nil), missing...)
+	if slices.Contains(profile.Items, ItemZabbix) &&
+		slices.Contains(installTargets, "zabbix-release") {
+		if err := backend.installZabbixRepository(ctx, profile.Config); err != nil {
+			return err
+		}
+		installTargets = slices.DeleteFunc(
+			installTargets,
+			func(name string) bool { return name == "zabbix-release" },
+		)
 	}
-	arguments := []string{"install", "-y", "--no-install-recommends", "--no-upgrade", "--"}
-	arguments = append(arguments, missing...)
-	if _, err := backend.run(ctx, execx.Spec{
-		Program: "apt-get", Arguments: arguments, Environment: environment,
-	}); err != nil {
-		return err
+	if len(installTargets) > 0 {
+		environment := map[string]string{"DEBIAN_FRONTEND": "noninteractive"}
+		if _, err := backend.run(ctx, execx.Spec{
+			Program: "apt-get", Arguments: []string{"update"}, Environment: environment,
+		}); err != nil {
+			return err
+		}
+		arguments := []string{
+			"install", "-y", "--no-install-recommends", "--no-upgrade", "--",
+		}
+		arguments = append(arguments, installTargets...)
+		if _, err := backend.run(ctx, execx.Spec{
+			Program: "apt-get", Arguments: arguments, Environment: environment,
+		}); err != nil {
+			return err
+		}
 	}
 	verified, err := backend.observePackages(ctx, profile)
 	if err != nil {
@@ -1460,6 +1511,39 @@ func (backend SystemBackend) applyPackages(ctx context.Context, profile Profile)
 		return errors.New("required packages did not converge after installation")
 	}
 	return nil
+}
+
+func approvedMissingPackages(details map[string]any) ([]string, error) {
+	raw, present := details["missing"]
+	if !present {
+		return nil, errors.New("approved package observation is missing exact state")
+	}
+	var values []string
+	switch typed := raw.(type) {
+	case []string:
+		values = append([]string(nil), typed...)
+	case []any:
+		values = make([]string, 0, len(typed))
+		for _, value := range typed {
+			name, ok := value.(string)
+			if !ok {
+				return nil, errors.New("approved package missing set is invalid")
+			}
+			values = append(values, name)
+		}
+	default:
+		return nil, errors.New("approved package missing set is invalid")
+	}
+	if !sort.StringsAreSorted(values) {
+		return nil, errors.New("approved package missing set is not canonical")
+	}
+	for index, name := range values {
+		if !packageName.MatchString(name) ||
+			index > 0 && values[index-1] == name {
+			return nil, errors.New("approved package missing set is invalid")
+		}
+	}
+	return values, nil
 }
 
 func (backend SystemBackend) packageInstalled(
@@ -1614,7 +1698,9 @@ func desiredPackages(profile Profile) []string {
 	for _, item := range profile.Items {
 		switch item {
 		case ItemUsers:
-			set["sudo"] = true
+			if len(profile.Config.Administrators) > 0 {
+				set["sudo"] = true
+			}
 		case ItemCronPermissions:
 			set["cron"] = true
 		case ItemSSH:
@@ -2312,7 +2398,11 @@ func (backend SystemBackend) activateManagedFileWithPostVerify(
 	postVerify func() error,
 ) (returnErr error) {
 	target := backend.path(managed.Path)
-	if err := backend.recoverManagedTransaction(target); err != nil {
+	if err := backend.recoverManagedTransaction(
+		ctx,
+		target,
+		managed.Activation,
+	); err != nil {
 		return err
 	}
 	if err := secureMkdirAll(
@@ -2391,17 +2481,23 @@ func (backend SystemBackend) activateManagedFileWithPostVerify(
 			return fmt.Errorf("backup %s: %w", managed.Path, err)
 		}
 		if err := syncDirectory(filepath.Dir(target)); err != nil {
-			return errors.Join(err, backend.recoverManagedTransaction(target))
+			return errors.Join(
+				err,
+				backend.recoverManagedTransaction(ctx, target, managed.Activation),
+			)
 		}
 		journal.Phase = "backed_up"
 		if err := writeManagedTransactionJournal(target, journal); err != nil {
-			return errors.Join(err, backend.recoverManagedTransaction(target))
+			return errors.Join(
+				err,
+				backend.recoverManagedTransaction(ctx, target, managed.Activation),
+			)
 		}
 	}
 	if err := os.Rename(stagedPath, target); err != nil {
 		return errors.Join(
 			fmt.Errorf("activate %s: %w", managed.Path, err),
-			backend.recoverManagedTransaction(target),
+			backend.recoverManagedTransaction(ctx, target, managed.Activation),
 		)
 	}
 	if err := syncDirectory(filepath.Dir(target)); err != nil {
@@ -2645,7 +2741,11 @@ func removeManagedTransactionJournal(target string) error {
 	return syncDirectory(filepath.Dir(target))
 }
 
-func (backend SystemBackend) recoverManagedTransaction(target string) error {
+func (backend SystemBackend) recoverManagedTransaction(
+	ctx context.Context,
+	target string,
+	activation *execx.Spec,
+) error {
 	journalPath := target + ".transaction-v1.json"
 	journalTemp := journalPath + ".stage"
 	if err := backend.removeTrustedRecoveryArtifact(journalTemp); err != nil {
@@ -2675,11 +2775,27 @@ func (backend SystemBackend) recoverManagedTransaction(target string) error {
 	if err != nil {
 		return err
 	}
+	targetExists, err := backend.trustedRecoveryArtifactExists(target)
+	if err != nil {
+		return err
+	}
+	stageExists, err := backend.trustedRecoveryArtifactExists(target + ".stage")
+	if err != nil {
+		return err
+	}
+	backupExists, err := backend.trustedRecoveryArtifactExists(target + ".rollback")
+	if err != nil {
+		return err
+	}
+	if err := validateManagedRecoveryState(
+		journal,
+		targetExists,
+		stageExists,
+		backupExists,
+	); err != nil {
+		return err
+	}
 	if journal.Phase == "verified" {
-		targetExists, err := backend.trustedRecoveryArtifactExists(target)
-		if err != nil {
-			return err
-		}
 		if !targetExists {
 			return errors.New("verified managed transaction target is missing")
 		}
@@ -2691,8 +2807,22 @@ func (backend SystemBackend) recoverManagedTransaction(target string) error {
 		}
 		return removeManagedTransactionJournal(target)
 	}
+	restoreEffectiveState := activation != nil &&
+		(journal.Phase == "activated" || journal.Phase == "rolling_back")
+	if journal.Phase != "rolling_back" {
+		journal.Phase = "rolling_back"
+		if err := writeManagedTransactionJournal(target, journal); err != nil {
+			return fmt.Errorf("record recovered managed rollback: %w", err)
+		}
+	}
 	if err := backend.rollbackInterruptedManagedTransaction(target, journal); err != nil {
-		return err
+		return fmt.Errorf("restore recovered managed file: %w", err)
+	}
+	if restoreEffectiveState {
+		spec := expandManagedSpec(*activation, "", target)
+		if _, err := backend.runCleanup(ctx, spec); err != nil {
+			return fmt.Errorf("restore recovered effective state: %w", err)
+		}
 	}
 	return removeManagedTransactionJournal(target)
 }

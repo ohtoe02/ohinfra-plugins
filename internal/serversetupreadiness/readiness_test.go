@@ -2,7 +2,11 @@ package serversetupreadiness
 
 import (
 	"context"
+	"os"
+	"strings"
 	"testing"
+
+	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
 )
 
 func TestRunExercisesIdempotencyDriftRepairAndSafeUpgrade(t *testing.T) {
@@ -29,5 +33,46 @@ func TestRunExercisesIdempotencyDriftRepairAndSafeUpgrade(t *testing.T) {
 		report.SystemSecondApplyChanges != 0 ||
 		!report.DependencyProbesPassed {
 		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestSevenImageWorkflowExecutesRealBinaryApplyTwice(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(content)
+	for _, required := range []string{
+		"binary-smoke /work/server-setup-base_linux_amd64",
+		"--tmpfs /etc/ohtools:",
+		"--tmpfs /etc/profile.d:",
+		"server-setup-entitlement-fixture_linux_amd64:/usr/bin/pro:ro",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("seven-image workflow is missing %q", required)
+		}
+	}
+}
+
+func TestValidateBinarySmokeRequiresFirstChangeAndSecondNoop(t *testing.T) {
+	t.Parallel()
+
+	initial := protocol.Result{
+		Status: protocol.StatusPass,
+		Changes: []protocol.Change{{
+			Object: "shell-history", Action: "converge", Status: "completed",
+		}},
+	}
+	second := protocol.Result{Status: protocol.StatusPass, Changes: []protocol.Change{}}
+	if err := validateBinarySmoke(initial, second); err != nil {
+		t.Fatal(err)
+	}
+	second.Changes = append(second.Changes, protocol.Change{
+		Object: "shell-history", Action: "converge", Status: "completed",
+	})
+	if err := validateBinarySmoke(initial, second); err == nil {
+		t.Fatal("second binary mutation was accepted as idempotent")
 	}
 }

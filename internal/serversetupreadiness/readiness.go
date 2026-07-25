@@ -1,10 +1,14 @@
 package serversetupreadiness
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -34,6 +38,150 @@ type Report struct {
 	SystemSecondApplyStatus  protocol.Status      `json:"system_second_apply_status"`
 	SystemSecondApplyChanges int                  `json:"system_second_apply_changes"`
 	DependencyProbesPassed   bool                 `json:"dependency_probes_passed"`
+}
+
+type BinarySmokeReport struct {
+	SchemaVersion     string          `json:"schema_version"`
+	InitialStatus     protocol.Status `json:"initial_status"`
+	InitialChanges    int             `json:"initial_changes"`
+	SecondStatus      protocol.Status `json:"second_status"`
+	SecondChanges     int             `json:"second_changes"`
+	SecondPlanChanges int             `json:"second_plan_changes"`
+}
+
+func RunBinarySmoke(
+	ctx context.Context,
+	binaryPath string,
+) (BinarySmokeReport, error) {
+	invocation := protocol.Invocation{
+		ProtocolVersion: protocol.ProtocolVersion,
+		RequestID:       "readiness-binary-apply",
+		CommandPath:     []string{"setup", "apply"},
+		Arguments:       []string{"shell-history"},
+		Options:         map[string]any{},
+	}
+	var firstPlan protocol.Plan
+	if err := runProtocolVerb(
+		ctx,
+		binaryPath,
+		"plan",
+		invocation,
+		&firstPlan,
+	); err != nil {
+		return BinarySmokeReport{}, err
+	}
+	digest, err := protocol.PlanDigest(firstPlan)
+	if err != nil {
+		return BinarySmokeReport{}, err
+	}
+	invocation.PlanDigest = digest
+	var initial protocol.Result
+	if err := runProtocolVerb(
+		ctx,
+		binaryPath,
+		"execute",
+		invocation,
+		&initial,
+	); err != nil {
+		return BinarySmokeReport{}, err
+	}
+	invocation.RequestID = "readiness-binary-apply-second"
+	invocation.PlanDigest = ""
+	var secondPlan protocol.Plan
+	if err := runProtocolVerb(
+		ctx,
+		binaryPath,
+		"plan",
+		invocation,
+		&secondPlan,
+	); err != nil {
+		return BinarySmokeReport{}, err
+	}
+	secondDigest, err := protocol.PlanDigest(secondPlan)
+	if err != nil {
+		return BinarySmokeReport{}, err
+	}
+	invocation.PlanDigest = secondDigest
+	var second protocol.Result
+	if err := runProtocolVerb(
+		ctx,
+		binaryPath,
+		"execute",
+		invocation,
+		&second,
+	); err != nil {
+		return BinarySmokeReport{}, err
+	}
+	if len(secondPlan.Changes) != 0 {
+		return BinarySmokeReport{}, errors.New(
+			"second real-binary plan was not idempotent",
+		)
+	}
+	if err := validateBinarySmoke(initial, second); err != nil {
+		return BinarySmokeReport{}, err
+	}
+	return BinarySmokeReport{
+		SchemaVersion:     "1",
+		InitialStatus:     initial.Status,
+		InitialChanges:    len(initial.Changes),
+		SecondStatus:      second.Status,
+		SecondChanges:     len(second.Changes),
+		SecondPlanChanges: len(secondPlan.Changes),
+	}, nil
+}
+
+func validateBinarySmoke(initial protocol.Result, second protocol.Result) error {
+	if initial.Status != protocol.StatusPass ||
+		len(initial.Changes) != 1 ||
+		initial.Changes[0].Object != string(serversetup.ItemShellHistory) {
+		return errors.New("first real-binary apply did not converge shell-history")
+	}
+	if second.Status != protocol.StatusPass || len(second.Changes) != 0 {
+		return errors.New("second real-binary apply was not a successful no-op")
+	}
+	return nil
+}
+
+func runProtocolVerb(
+	ctx context.Context,
+	binaryPath string,
+	verb string,
+	invocation protocol.Invocation,
+	output any,
+) error {
+	encoded, err := json.Marshal(invocation)
+	if err != nil {
+		return err
+	}
+	// #nosec G204 -- readiness executes the exact CI-built binary path supplied by the gate.
+	command := exec.CommandContext(ctx, binaryPath, verb, "--protocol=1")
+	command.Stdin = bytes.NewReader(encoded)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		return fmt.Errorf(
+			"%s protocol %s failed: %w: %s",
+			binaryPath,
+			verb,
+			err,
+			strings.TrimSpace(stderr.String()),
+		)
+	}
+	if stdout.Len() == 0 || stdout.Len() > 1<<20 || stderr.Len() != 0 {
+		return fmt.Errorf("%s protocol %s returned unsafe output", binaryPath, verb)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(stdout.Bytes()))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(output); err != nil {
+		return fmt.Errorf("decode %s protocol output: %w", verb, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%s protocol output has trailing JSON", verb)
+	}
+	return nil
 }
 
 func Run(ctx context.Context, osRelease []byte, root string) (Report, error) {
@@ -114,7 +262,7 @@ func Run(ctx context.Context, osRelease []byte, root string) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	dependencyProbesPassed, err := probeRuntimeDependencies()
+	dependencyProbesPassed, err := probeRuntimeDependencies(ctx)
 	if err != nil {
 		return Report{}, err
 	}
@@ -231,21 +379,46 @@ func exerciseSafeSystemBackend(
 	return initial, second, nil
 }
 
-func probeRuntimeDependencies() (bool, error) {
+func probeRuntimeDependencies(ctx context.Context) (bool, error) {
 	if runtime.GOOS != "linux" {
 		return true, nil
 	}
-	for _, dependency := range []string{
-		"/bin/sh",
-		"/usr/bin/apt-get",
-		"/usr/bin/dpkg-query",
-	} {
-		info, err := os.Stat(dependency)
+	probes := []struct {
+		path      string
+		arguments []string
+		required  bool
+	}{
+		{path: "/bin/sh", required: true},
+		{path: "/usr/bin/apt-get", arguments: []string{"--version"}, required: true},
+		{path: "/usr/bin/dpkg-query", arguments: []string{"--version"}, required: true},
+		{path: "/usr/bin/systemctl", arguments: []string{"--version"}},
+		{path: "/usr/sbin/sshd", arguments: []string{"-V"}},
+		{path: "/usr/sbin/nft", arguments: []string{"--version"}},
+		{path: "/usr/bin/nft", arguments: []string{"--version"}},
+	}
+	for _, probe := range probes {
+		info, err := os.Stat(probe.path)
+		if errors.Is(err, os.ErrNotExist) && !probe.required {
+			continue
+		}
 		if err != nil {
-			return false, fmt.Errorf("probe runtime dependency %s: %w", dependency, err)
+			return false, fmt.Errorf("probe runtime dependency %s: %w", probe.path, err)
 		}
 		if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-			return false, fmt.Errorf("runtime dependency %s is not executable", dependency)
+			return false, fmt.Errorf("runtime dependency %s is not executable", probe.path)
+		}
+		if len(probe.arguments) == 0 {
+			continue
+		}
+		// #nosec G204 -- readiness probes fixed absolute system dependency paths.
+		command := exec.CommandContext(ctx, probe.path, probe.arguments...)
+		if output, err := command.CombinedOutput(); err != nil {
+			return false, fmt.Errorf(
+				"run dependency probe %s: %w: %s",
+				probe.path,
+				err,
+				strings.TrimSpace(string(output)),
+			)
 		}
 	}
 	return true, nil

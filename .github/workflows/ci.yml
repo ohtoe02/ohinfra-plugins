@@ -109,6 +109,11 @@ jobs:
             -o server-setup-base_linux_amd64 ./cmd/server-setup-base
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
             -o server-setup-readiness_linux_amd64 ./tools/server-setup-readiness
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -o server-setup-entitlement-fixture_linux_amd64 \
+            ./tools/server-setup-entitlement-fixture
+          sudo chown root:root server-setup-entitlement-fixture_linux_amd64
+          chmod 0755 server-setup-entitlement-fixture_linux_amd64
       - name: Run plugin inside declared OS image
         shell: bash
         env:
@@ -130,9 +135,31 @@ jobs:
             '
           docker run --rm --network none --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+            --tmpfs /etc/ohtools:rw,nosuid,nodev,size=1m,mode=0755 \
+            --tmpfs /etc/profile.d:rw,nosuid,nodev,size=1m,mode=0755 \
+            --tmpfs /etc/apt/sources.list.d:rw,nosuid,nodev,size=1m,mode=0755 \
             --volume "$PWD:/work:ro" \
-            "$IMAGE" /work/server-setup-readiness_linux_amd64 \
-            > server-setup-readiness-report.json
+            --volume "$PWD/server-setup-entitlement-fixture_linux_amd64:/usr/bin/pro:ro" \
+            "$IMAGE" sh -ceu '
+              . /etc/os-release
+              mkdir -p /etc/ohtools/plugins
+              printf "%s\n" \
+                "enabled_items: [packages, shell-history]" \
+                "packages: []" \
+                "administrators: []" \
+                "ssh_port: 22" \
+                "manage_firewall: false" \
+                > /etc/ohtools/plugins/server-setup-base.yaml
+              if [ "$ID" = debian ] && [ "$VERSION_ID" = 10 ]; then
+                printf "%s\n" \
+                  "deb https://deb.freexian.com/extended-lts buster-lts main" \
+                  > /etc/apt/sources.list.d/extended-lts.list
+              fi
+              /work/server-setup-readiness_linux_amd64 binary-smoke /work/server-setup-base_linux_amd64 \
+                >/tmp/binary-smoke.json
+              test -s /tmp/binary-smoke.json
+              /work/server-setup-readiness_linux_amd64
+            ' > server-setup-readiness-report.json
           ./server-setup-readiness_linux_amd64 verify-report \
             server-setup-readiness-report.json \
             "$EXPECTED_ID" "$EXPECTED_VERSION"
