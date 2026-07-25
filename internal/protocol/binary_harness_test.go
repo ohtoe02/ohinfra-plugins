@@ -193,16 +193,17 @@ func runFixtureWithLimits(
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	command.WaitDelay = 500 * time.Millisecond
+	configureFixtureCommand(command)
 	err := command.Run()
 	if stdout.exceeded || stderr.exceeded {
-		if command.ProcessState == nil || !command.ProcessState.Exited() {
-			t.Fatal("output-limited fixture process was not reaped")
+		if reapErr := verifyFixtureCommandReaped(command); reapErr != nil {
+			t.Fatalf("output-limited fixture process was not reaped: %v", reapErr)
 		}
 		return stdout.Bytes(), stderr.Bytes(), harnessOutputLimitExit
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		if command.ProcessState == nil || !command.ProcessState.Exited() {
-			t.Fatal("timed-out fixture process was not reaped")
+		if reapErr := verifyFixtureCommandReaped(command); reapErr != nil {
+			t.Fatalf("timed-out fixture process was not reaped: %v", reapErr)
 		}
 		return stdout.Bytes(), stderr.Bytes(), harnessTimeoutExit
 	}
