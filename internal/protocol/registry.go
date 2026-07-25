@@ -7,6 +7,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"time"
 )
 
 type DefinitionSpec struct {
@@ -201,7 +202,7 @@ func validateInvocation(command Command, invocation Invocation, mutation bool) e
 			return argumentFailure(fmt.Sprintf("option %q has the wrong type", name))
 		}
 	}
-	if mutation && invocation.PlanDigest == "" {
+	if mutation && !validPlanDigest(invocation.PlanDigest) {
 		return argumentFailure("mutation execution requires an approved plan_digest")
 	}
 	if !mutation && invocation.PlanDigest != "" {
@@ -212,9 +213,16 @@ func validateInvocation(command Command, invocation Invocation, mutation bool) e
 
 func validOptionValue(flagType string, value any) bool {
 	switch flagType {
-	case "string", "duration":
+	case "string":
 		_, ok := value.(string)
 		return ok
+	case "duration":
+		text, ok := value.(string)
+		if !ok {
+			return false
+		}
+		_, err := time.ParseDuration(text)
+		return err == nil
 	case "bool":
 		_, ok := value.(bool)
 		return ok
@@ -231,6 +239,18 @@ func validOptionValue(flagType string, value any) bool {
 	default:
 		return false
 	}
+}
+
+func validPlanDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeBindingPlan(plan Plan, command Command) Plan {

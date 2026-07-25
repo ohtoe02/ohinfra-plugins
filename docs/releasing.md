@@ -8,7 +8,9 @@ Each plugin is versioned independently.
    `docker-base-v1.0.0`.
 3. Push the tag. The protected release workflow validates the tag, rebuilds the
    selected binary with `CGO_ENABLED=0`, and injects version, commit, and build
-   date with ldflags.
+   date with ldflags. It atomically creates a new draft release, fails if that
+   release already exists, uploads without clobbering assets, and only then
+   publishes the draft.
 4. Verify the raw `linux/amd64` binary, SHA-256 file, SPDX JSON SBOM, exact
    manifest, and `<plugin>_release-metadata-v1.json`.
 5. Import the sidecar with the catalog tooling. It binds the immutable URL,

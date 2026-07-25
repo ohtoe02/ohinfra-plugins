@@ -166,6 +166,17 @@ func TestBuildReleaseMetadataBindsBinaryAndManifest(t *testing.T) {
 	if _, err := BuildReleaseMetadata(entry, "1.1.0", manifest, binary, metadata.Asset.URL, published); err == nil {
 		t.Fatal("manifest version mismatch accepted")
 	}
+	manifest.Version = "1.1.0"
+	if _, err := BuildReleaseMetadata(
+		entry,
+		"1.1.0",
+		manifest,
+		binary,
+		"https://github.com/ohtoe02/ohtools-plugins/releases/latest/download/system-base_linux_amd64",
+		published,
+	); err == nil {
+		t.Fatal("mutable release URL accepted")
+	}
 }
 
 func TestLoadRejectsSymlinkedReleaseCommand(t *testing.T) {
@@ -205,12 +216,23 @@ func TestReleaseWorkflowRefusesToOverwritePublishedAssets(t *testing.T) {
 	}
 	content := string(workflow)
 	for _, required := range []string{
-		`gh release view "${GITHUB_REF_NAME}"`,
-		"release already exists; refusing to replace immutable assets",
-		"overwrite_files: false",
+		`gh release create "${GITHUB_REF_NAME}"`,
+		"--verify-tag",
+		"--draft",
+		`gh release upload "${GITHUB_REF_NAME}"`,
+		`gh release edit "${GITHUB_REF_NAME}" --draft=false`,
 	} {
 		if !strings.Contains(content, required) {
 			t.Errorf("release workflow lacks fail-closed immutability guard %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`gh release view "${GITHUB_REF_NAME}"`,
+		"softprops/action-gh-release",
+		"--clobber",
+	} {
+		if strings.Contains(content, forbidden) {
+			t.Errorf("release workflow retains non-atomic or clobbering path %q", forbidden)
 		}
 	}
 }
