@@ -109,5 +109,14 @@ nftables configuration.
 The supported OS matrix is Debian 10–13 and Ubuntu 20.04, 22.04, and 24.04 LTS.
 Debian 10 requires an active Freexian ELTS source; Ubuntu 20.04 requires an
 attached Ubuntu Pro/ESM entitlement before a mutation is planned. `setup
-upgrade` uses isolated APT indexes and ordinary `upgrade --with-new-pkgs`; it
-never runs `dist-upgrade`, `autoremove`, or reboot.
+upgrade` plans with a fully removed temporary APT-index workspace and installs
+only the exact package versions in the confirmed plan. It never runs
+`dist-upgrade`, `autoremove`, or reboot.
+
+Managed-file transactions fail closed when a previous crash leaves a
+`.stage`, `.rollback`, `.ohtools-include.stage`, or
+`.ohtools-include.rollback` artifact. Before retrying, an administrator must
+inspect the target and artifact, restore the known-good file when necessary,
+validate the affected subsystem with its native tool, and only then remove the
+stale artifact. The plugin never guesses which side of an interrupted rename
+is authoritative.

@@ -24,3 +24,21 @@ func TestTrustedKeySourceRejectsNonRootOwner(t *testing.T) {
 		t.Fatal("non-root-owned authorized key source was accepted")
 	}
 }
+
+func TestManagedPathsRequireRootOwnershipInProduction(t *testing.T) {
+	if err := validateManagedMetadata(65534, 0o644, false, false); err == nil {
+		t.Fatal("non-root-owned managed file was accepted")
+	}
+	if err := validateManagedMetadata(0, 0o664, false, false); err == nil {
+		t.Fatal("group-writable managed file was accepted")
+	}
+	if err := validateManagedMetadata(0, os.ModeDir|0o755, true, false); err != nil {
+		t.Fatalf("root-owned protected directory was rejected: %v", err)
+	}
+	if !administratorOwnerAllowed(1000, 1000, 2000, false) {
+		t.Fatal("administrator-owned path was rejected in production")
+	}
+	if administratorOwnerAllowed(0, 1000, 2000, false) {
+		t.Fatal("root-owned administrator path was accepted in production")
+	}
+}

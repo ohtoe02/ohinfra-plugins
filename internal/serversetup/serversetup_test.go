@@ -2,12 +2,16 @@ package serversetup
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ohtoe02/ohtools-plugins/internal/execx"
 	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
 )
 
@@ -147,6 +151,71 @@ func TestPlanAndApplyConvergeWithoutSecondMutation(t *testing.T) {
 	}
 }
 
+func TestPlanDigestBindsHashedAuthorizedKeyMaterial(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	source := filepath.Join(root, "etc", "ohtools", "plugins", "keys", "operator.pub")
+	if err := os.MkdirAll(filepath.Dir(source), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	firstKey := validEd25519PublicKey("first@example")
+	if err := os.WriteFile(source, []byte(firstKey+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			if spec.Program == "id" {
+				return execx.Output{ExitCode: 1}, nil
+			}
+			return execx.Output{}, nil
+		}),
+	}
+	config := DefaultConfig()
+	config.Administrators = []Administrator{{
+		Name:                 "operator",
+		AuthorizedKeySources: []string{"/etc/ohtools/plugins/keys/operator.pub"},
+	}}
+	manager := Manager{
+		Backend: backend, Config: config,
+		Platform: Platform{ID: "debian", Version: "12"},
+	}
+	first, err := manager.Plan(context.Background(), []string{"users"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDigest, err := protocol.PlanDigest(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondKey := validEd25519PublicKeyWithSeed("second@example", 2)
+	if secondKey == firstKey {
+		t.Fatal("key fixture did not change")
+	}
+	if err := os.WriteFile(source, []byte(secondKey+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Plan(context.Background(), []string{"users"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDigest, err := protocol.PlanDigest(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstDigest == secondDigest {
+		t.Fatal("authorized key material did not change the plan digest")
+	}
+	encoded, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), firstKey) {
+		t.Fatal("raw authorized key material leaked into the plan")
+	}
+}
+
 func TestMutationRequiresExtendedSupportEntitlementBeforePlanningChanges(t *testing.T) {
 	t.Parallel()
 
@@ -202,8 +271,8 @@ func TestCheckReportsEverySelectedItemAndTargetedRecommendations(t *testing.T) {
 		t.Fatalf("recommendations = %#v", result.Data["recommendations"])
 	}
 	if !reflect.DeepEqual(recommendations, []string{
-		"sudo ohtools setup apply packages",
-		"sudo ohtools setup apply ssh",
+		"ohtools setup apply packages",
+		"ohtools setup apply ssh",
 	}) {
 		t.Fatalf("recommendations = %#v", recommendations)
 	}

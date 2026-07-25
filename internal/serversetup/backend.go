@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,10 +16,12 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -112,6 +116,33 @@ func (backend SystemBackend) Observe(
 	}
 }
 
+func (backend SystemBackend) DesiredStateMaterial(
+	_ context.Context,
+	profile Profile,
+) (map[string]string, error) {
+	material := make(map[string]string)
+	if !slices.Contains(profile.Items, ItemUsers) {
+		return material, nil
+	}
+	for _, administrator := range profile.Config.Administrators {
+		if len(administrator.AuthorizedKeySources) == 0 {
+			continue
+		}
+		keys, err := backend.desiredAuthorizedKeys(administrator)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := json.Marshal(keys)
+		if err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256(encoded)
+		material["administrator:"+administrator.Name+":authorized_keys"] =
+			hex.EncodeToString(sum[:])
+	}
+	return material, nil
+}
+
 func (backend SystemBackend) Apply(
 	ctx context.Context,
 	item Item,
@@ -134,7 +165,20 @@ func (backend SystemBackend) Apply(
 		if managed == nil {
 			return nil
 		}
-		return backend.activateManagedFile(ctx, *managed)
+		return backend.activateManagedFileWithPostVerify(
+			ctx,
+			*managed,
+			func() error {
+				converged, verifyErr := backend.managedFileContentConverged(*managed)
+				if verifyErr != nil {
+					return verifyErr
+				}
+				if !converged {
+					return fmt.Errorf("%s did not converge", item)
+				}
+				return nil
+			},
+		)
 	}
 }
 
@@ -153,15 +197,24 @@ type fileSnapshot struct {
 	existed bool
 }
 
+type firewallState struct {
+	enabled     bool
+	active      bool
+	activeRules []byte
+}
+
 func (backend SystemBackend) applySSH(
 	ctx context.Context,
 	profile Profile,
 ) error {
+	if err := backend.ensureSSHAdministratorAccess(ctx, profile); err != nil {
+		return err
+	}
 	managed, err := backend.desiredFile(ItemSSH, profile)
 	if err != nil {
 		return err
 	}
-	snapshot, err := captureFileSnapshot(backend.path(managed.Path))
+	snapshot, err := backend.captureFileSnapshot(backend.path(managed.Path))
 	if err != nil {
 		return err
 	}
@@ -198,7 +251,28 @@ func (backend SystemBackend) applySSH(
 	return include.commit()
 }
 
-func captureFileSnapshot(path string) (fileSnapshot, error) {
+func (backend SystemBackend) ensureSSHAdministratorAccess(
+	ctx context.Context,
+	profile Profile,
+) error {
+	for _, administrator := range profile.Config.Administrators {
+		if len(administrator.AuthorizedKeySources) == 0 {
+			continue
+		}
+		state, err := backend.observeAdministrator(ctx, administrator)
+		if err != nil {
+			return err
+		}
+		if state.Exists && !state.MissingAuthorizedKeys {
+			return nil
+		}
+	}
+	return errors.New(
+		"SSH hardening requires a usable administrator login with an installed validated key",
+	)
+}
+
+func (backend SystemBackend) captureFileSnapshot(path string) (fileSnapshot, error) {
 	snapshot := fileSnapshot{path: path}
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -210,6 +284,9 @@ func captureFileSnapshot(path string) (fileSnapshot, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() ||
 		info.Size() > 1<<20 {
 		return snapshot, fmt.Errorf("managed path %s is unsafe", path)
+	}
+	if err := validateManagedPath(path, info, false, backend.Root != ""); err != nil {
+		return snapshot, err
 	}
 	content, err := os.ReadFile(path) // #nosec G304 -- fixed managed path.
 	if err != nil {
@@ -281,7 +358,12 @@ func (backend SystemBackend) observeFirewall(
 			active.ExitCode,
 		)
 	}
-	converged := enabled.ExitCode == 0 && active.ExitCode == 0
+	rules, err := backend.desiredFile(ItemFirewall, profile)
+	if err != nil {
+		return Observation{}, err
+	}
+	converged := enabled.ExitCode == 0 && active.ExitCode == 0 &&
+		firewallRulesEqual(active.Stdout, rules.Content)
 	summary := "firewall service or active rules differ from the desired state"
 	if converged {
 		summary = "firewall persistence and active rules match the desired state"
@@ -293,6 +375,10 @@ func (backend SystemBackend) applyFirewall(
 	ctx context.Context,
 	profile Profile,
 ) error {
+	previousState, err := backend.captureFirewallState(ctx)
+	if err != nil {
+		return err
+	}
 	files, err := backend.firewallFiles(profile)
 	if err != nil {
 		return err
@@ -300,7 +386,7 @@ func (backend SystemBackend) applyFirewall(
 	snapshots := make([]fileSnapshot, 0, len(files))
 	unitChanged := false
 	for _, managed := range files {
-		snapshot, err := captureFileSnapshot(backend.path(managed.Path))
+		snapshot, err := backend.captureFileSnapshot(backend.path(managed.Path))
 		if err != nil {
 			return err
 		}
@@ -317,14 +403,20 @@ func (backend SystemBackend) applyFirewall(
 		}
 		managed.Activation = nil
 		if err := backend.activateManagedFile(ctx, managed); err != nil {
-			return errors.Join(err, backend.rollbackFirewall(ctx, snapshots, unitChanged))
+			return errors.Join(
+				err,
+				backend.rollbackFirewall(ctx, snapshots, unitChanged, previousState),
+			)
 		}
 	}
 	if unitChanged {
 		if _, err := backend.run(ctx, execx.Spec{
 			Program: "systemctl", Arguments: []string{"daemon-reload"},
 		}); err != nil {
-			return errors.Join(err, backend.rollbackFirewall(ctx, snapshots, unitChanged))
+			return errors.Join(
+				err,
+				backend.rollbackFirewall(ctx, snapshots, unitChanged, previousState),
+			)
 		}
 	}
 	if _, err := backend.run(ctx, execx.Spec{
@@ -333,7 +425,10 @@ func (backend SystemBackend) applyFirewall(
 			"enable", "--", "ohtools-server-setup-firewall.service",
 		},
 	}); err != nil {
-		return errors.Join(err, backend.rollbackFirewall(ctx, snapshots, unitChanged))
+		return errors.Join(
+			err,
+			backend.rollbackFirewall(ctx, snapshots, unitChanged, previousState),
+		)
 	}
 	if _, err := backend.run(ctx, execx.Spec{
 		Program: "systemctl",
@@ -341,7 +436,20 @@ func (backend SystemBackend) applyFirewall(
 			"restart", "--", "ohtools-server-setup-firewall.service",
 		},
 	}); err != nil {
-		return errors.Join(err, backend.rollbackFirewall(ctx, snapshots, unitChanged))
+		return errors.Join(
+			err,
+			backend.rollbackFirewall(ctx, snapshots, unitChanged, previousState),
+		)
+	}
+	observation, err := backend.observeFirewall(ctx, profile)
+	if err != nil || !observation.Converged {
+		if err == nil {
+			err = errors.New("firewall did not converge")
+		}
+		return errors.Join(
+			err,
+			backend.rollbackFirewall(ctx, snapshots, unitChanged, previousState),
+		)
 	}
 	return nil
 }
@@ -350,15 +458,86 @@ func (backend SystemBackend) rollbackFirewall(
 	ctx context.Context,
 	snapshots []fileSnapshot,
 	unitChanged bool,
+	previous firewallState,
 ) error {
 	restoreErr := restoreFileSnapshots(snapshots)
-	if !unitChanged {
-		return restoreErr
+	var reloadErr error
+	if unitChanged {
+		_, reloadErr = backend.run(ctx, execx.Spec{
+			Program: "systemctl", Arguments: []string{"daemon-reload"},
+		})
 	}
-	_, reloadErr := backend.run(ctx, execx.Spec{
-		Program: "systemctl", Arguments: []string{"daemon-reload"},
+	action := "disable"
+	if previous.enabled {
+		action = "enable"
+	}
+	_, enablementErr := backend.run(ctx, execx.Spec{
+		Program: "systemctl",
+		Arguments: []string{
+			action, "--", "ohtools-server-setup-firewall.service",
+		},
 	})
-	return errors.Join(restoreErr, reloadErr)
+	activeErr := backend.restoreFirewallActiveState(ctx, previous)
+	return errors.Join(restoreErr, reloadErr, enablementErr, activeErr)
+}
+
+func (backend SystemBackend) captureFirewallState(ctx context.Context) (firewallState, error) {
+	state := firewallState{}
+	enabled, err := backend.runRaw(ctx, execx.Spec{
+		Program: "systemctl",
+		Arguments: []string{
+			"is-enabled", "--", "ohtools-server-setup-firewall.service",
+		},
+	})
+	if err != nil {
+		return state, err
+	}
+	if enabled.ExitCode != 0 && enabled.ExitCode != 1 {
+		return state, fmt.Errorf("inspect firewall enablement: exit %d", enabled.ExitCode)
+	}
+	state.enabled = enabled.ExitCode == 0
+	active, err := backend.runRaw(ctx, execx.Spec{
+		Program: "nft",
+		Arguments: []string{
+			"list", "table", "inet", "ohtools_server_setup",
+		},
+	})
+	if err != nil {
+		return state, err
+	}
+	if active.ExitCode != 0 && active.ExitCode != 1 {
+		return state, fmt.Errorf("inspect active firewall rules: exit %d", active.ExitCode)
+	}
+	state.active = active.ExitCode == 0
+	state.activeRules = append([]byte(nil), active.Stdout...)
+	return state, nil
+}
+
+func (backend SystemBackend) restoreFirewallActiveState(
+	ctx context.Context,
+	previous firewallState,
+) error {
+	deleted, err := backend.runRaw(ctx, execx.Spec{
+		Program: "nft",
+		Arguments: []string{
+			"delete", "table", "inet", "ohtools_server_setup",
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if deleted.ExitCode != 0 && deleted.ExitCode != 1 {
+		return fmt.Errorf("remove failed active firewall state: exit %d", deleted.ExitCode)
+	}
+	if !previous.active {
+		return nil
+	}
+	_, err = backend.run(ctx, execx.Spec{
+		Program:   "nft",
+		Arguments: []string{"-f", "-"},
+		Stdin:     previous.activeRules,
+	})
+	return err
 }
 
 func (backend SystemBackend) firewallFiles(profile Profile) ([]managedFile, error) {
@@ -436,6 +615,9 @@ func (backend SystemBackend) observeSSH(
 
 func (backend SystemBackend) sshIncludePresent() (bool, error) {
 	target := backend.path("/etc/ssh/sshd_config")
+	if err := ensureNoSSHIncludeArtifacts(target); err != nil {
+		return false, err
+	}
 	info, err := os.Lstat(target)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -447,6 +629,9 @@ func (backend SystemBackend) sshIncludePresent() (bool, error) {
 		info.Size() > 1<<20 ||
 		runtime.GOOS != "windows" && info.Mode().Perm()&0o022 != 0 {
 		return false, errors.New("main SSH configuration is unsafe")
+	}
+	if err := validateManagedPath(target, info, false, backend.Root != ""); err != nil {
+		return false, err
 	}
 	content, err := os.ReadFile(target) // #nosec G304 -- fixed system configuration path.
 	if err != nil {
@@ -460,6 +645,24 @@ func (backend SystemBackend) sshIncludePresent() (bool, error) {
 		return strings.EqualFold(line, sshIncludeDirective), nil
 	}
 	return false, nil
+}
+
+func ensureNoSSHIncludeArtifacts(target string) error {
+	for _, suffix := range []string{
+		".ohtools-include.stage",
+		".ohtools-include.rollback",
+	} {
+		artifact := target + suffix
+		if _, err := os.Lstat(artifact); err == nil {
+			return fmt.Errorf(
+				"stale SSH include transaction artifact %s requires recovery",
+				artifact,
+			)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (backend SystemBackend) beginSSHInclude(
@@ -478,12 +681,19 @@ func (backend SystemBackend) beginSSHInclude(
 	if err != nil {
 		return change, fmt.Errorf("inspect main SSH configuration: %w", err)
 	}
+	if err := validateManagedPath(target, info, false, backend.Root != ""); err != nil {
+		return change, err
+	}
 	original, err := os.ReadFile(target) // #nosec G304 -- fixed system configuration path.
 	if err != nil {
 		return change, err
 	}
 	directory := filepath.Dir(target)
-	if err := secureMkdirAll(backend.path("/etc/ssh/sshd_config.d"), 0o755); err != nil {
+	if err := secureMkdirAll(
+		backend.path("/etc/ssh/sshd_config.d"),
+		0o755,
+		backend.Root != "",
+	); err != nil {
 		return change, err
 	}
 	staged, err := os.OpenFile(
@@ -764,7 +974,7 @@ func (backend SystemBackend) installZabbixRepository(ctx context.Context, config
 		return errors.New("Zabbix repository package SHA-256 does not match")
 	}
 	directory := backend.path("/var/cache/ohtools/server-setup/downloads")
-	if err := secureMkdirAll(directory, 0o700); err != nil {
+	if err := secureMkdirAll(directory, 0o700, backend.Root != ""); err != nil {
 		return err
 	}
 	file, err := os.CreateTemp(directory, "zabbix-release-*.deb")
@@ -912,6 +1122,18 @@ func (backend SystemBackend) applyUsers(ctx context.Context, profile Profile) er
 			}); err != nil {
 				return err
 			}
+			if len(administrator.AuthorizedKeySources) > 0 {
+				state, err = backend.observeAdministrator(ctx, administrator)
+				if err != nil {
+					return err
+				}
+				if !state.Exists {
+					return fmt.Errorf(
+						"administrator %s was not created",
+						administrator.Name,
+					)
+				}
+			}
 		} else if len(state.MissingGroups) > 0 {
 			if _, err := backend.run(ctx, execx.Spec{
 				Program: "usermod",
@@ -923,7 +1145,7 @@ func (backend SystemBackend) applyUsers(ctx context.Context, profile Profile) er
 				return err
 			}
 		}
-		if err := backend.installAuthorizedKeys(administrator); err != nil {
+		if err := backend.installAuthorizedKeys(administrator, state); err != nil {
 			return err
 		}
 	}
@@ -934,6 +1156,10 @@ type administratorState struct {
 	Exists                bool
 	MissingGroups         []string
 	MissingAuthorizedKeys bool
+	Home                  string
+	Shell                 string
+	UID                   uint32
+	GID                   uint32
 }
 
 func (backend SystemBackend) observeAdministrator(
@@ -957,6 +1183,49 @@ func (backend SystemBackend) observeAdministrator(
 		)
 	}
 	state := administratorState{Exists: true}
+	account, err := backend.runRaw(ctx, execx.Spec{
+		Program: "getent", Arguments: []string{"passwd", "--", administrator.Name},
+	})
+	if err != nil {
+		return administratorState{}, err
+	}
+	if account.ExitCode != 0 {
+		return administratorState{}, fmt.Errorf(
+			"inspect account for %s: getent exited with %d",
+			administrator.Name,
+			account.ExitCode,
+		)
+	}
+	fields := strings.Split(strings.TrimSpace(string(account.Stdout)), ":")
+	if len(fields) != 7 || fields[0] != administrator.Name {
+		return administratorState{}, fmt.Errorf(
+			"administrator %s has an invalid account record",
+			administrator.Name,
+		)
+	}
+	uid, uidErr := strconv.ParseUint(fields[2], 10, 32)
+	gid, gidErr := strconv.ParseUint(fields[3], 10, 32)
+	state.Home, state.Shell = fields[5], fields[6]
+	if !validAdministratorHome(state.Home) || !validLoginShell(state.Shell) {
+		return administratorState{}, fmt.Errorf(
+			"administrator %s does not have a usable home and login shell",
+			administrator.Name,
+		)
+	}
+	if uidErr != nil || gidErr != nil {
+		return administratorState{}, fmt.Errorf(
+			"administrator %s has invalid numeric identity metadata",
+			administrator.Name,
+		)
+	}
+	state.UID, state.GID = uint32(uid), uint32(gid)
+	if err := backend.validateAdministratorHome(state); err != nil {
+		return administratorState{}, fmt.Errorf(
+			"administrator %s does not have a usable home: %w",
+			administrator.Name,
+			err,
+		)
+	}
 	if len(administrator.Groups) > 0 {
 		output, err = backend.runRaw(ctx, execx.Spec{
 			Program: "id", Arguments: []string{"-nG", "--", administrator.Name},
@@ -983,7 +1252,7 @@ func (backend SystemBackend) observeAdministrator(
 		sort.Strings(state.MissingGroups)
 	}
 	if len(administrator.AuthorizedKeySources) > 0 {
-		converged, err := backend.authorizedKeysConverged(administrator)
+		converged, err := backend.authorizedKeysConverged(administrator, state)
 		if err != nil {
 			return administratorState{}, err
 		}
@@ -992,7 +1261,10 @@ func (backend SystemBackend) observeAdministrator(
 	return state, nil
 }
 
-func (backend SystemBackend) installAuthorizedKeys(administrator Administrator) error {
+func (backend SystemBackend) installAuthorizedKeys(
+	administrator Administrator,
+	state administratorState,
+) error {
 	if len(administrator.AuthorizedKeySources) == 0 {
 		return nil
 	}
@@ -1000,8 +1272,12 @@ func (backend SystemBackend) installAuthorizedKeys(administrator Administrator) 
 	if err != nil {
 		return err
 	}
-	target := backend.path("/home/" + administrator.Name + "/.ssh/authorized_keys")
-	return backend.mergeLines(target, keys, 0o600)
+	directory, err := backend.ensureAdministratorSSHDirectory(state)
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(directory, "authorized_keys")
+	return backend.mergeLines(target, keys, 0o600, state)
 }
 
 func (backend SystemBackend) desiredAuthorizedKeys(
@@ -1019,7 +1295,11 @@ func (backend SystemBackend) desiredAuthorizedKeys(
 			info.Size() > 1<<20 {
 			return nil, fmt.Errorf("authorized key source %s is unsafe", source)
 		}
-		if err := validateTrustedKeySource(trustedPath, info); err != nil {
+		if err := validateTrustedKeySource(
+			trustedPath,
+			info,
+			backend.Root != "",
+		); err != nil {
 			return nil, err
 		}
 		content, err := os.ReadFile(trustedPath) // #nosec G304 -- validated fixed config path.
@@ -1043,12 +1323,13 @@ func (backend SystemBackend) desiredAuthorizedKeys(
 
 func (backend SystemBackend) authorizedKeysConverged(
 	administrator Administrator,
+	state administratorState,
 ) (bool, error) {
 	desired, err := backend.desiredAuthorizedKeys(administrator)
 	if err != nil {
 		return false, err
 	}
-	target := backend.path("/home/" + administrator.Name + "/.ssh/authorized_keys")
+	target := backend.path(state.Home + "/.ssh/authorized_keys")
 	info, err := os.Lstat(target)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -1060,6 +1341,15 @@ func (backend SystemBackend) authorizedKeysConverged(
 		info.Size() > 1<<20 ||
 		runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		return false, errors.New("authorized_keys target is unsafe")
+	}
+	if err := validateAdministratorPath(
+		target,
+		info,
+		state.UID,
+		false,
+		backend.Root != "",
+	); err != nil {
+		return false, err
 	}
 	content, err := os.ReadFile(target) // #nosec G304 -- derived fixed user path.
 	if err != nil {
@@ -1080,6 +1370,86 @@ func (backend SystemBackend) authorizedKeysConverged(
 	return true, nil
 }
 
+func validAdministratorHome(home string) bool {
+	return path.IsAbs(home) && path.Clean(home) == home && home != "/"
+}
+
+func validLoginShell(shell string) bool {
+	if !path.IsAbs(shell) || path.Clean(shell) != shell {
+		return false
+	}
+	switch shell {
+	case "/bin/false", "/usr/bin/false", "/sbin/nologin", "/usr/sbin/nologin":
+		return false
+	default:
+		return true
+	}
+}
+
+func (backend SystemBackend) validateAdministratorHome(
+	state administratorState,
+) error {
+	target := backend.path(state.Home)
+	if err := secureMkdirAll(filepath.Dir(target), 0o755, backend.Root != ""); err != nil {
+		return err
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("home path is not a safe directory")
+	}
+	return validateAdministratorPath(
+		target,
+		info,
+		state.UID,
+		true,
+		backend.Root != "",
+	)
+}
+
+func (backend SystemBackend) ensureAdministratorSSHDirectory(
+	state administratorState,
+) (string, error) {
+	if err := backend.validateAdministratorHome(state); err != nil {
+		return "", err
+	}
+	directory := backend.path(state.Home + "/.ssh")
+	info, err := os.Lstat(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			return "", err
+		}
+		if err := setAdministratorOwner(
+			directory,
+			state.UID,
+			state.GID,
+			backend.Root != "",
+		); err != nil {
+			return "", err
+		}
+		info, err = os.Lstat(directory)
+	}
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() ||
+		runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return "", errors.New("administrator .ssh directory is unsafe")
+	}
+	if err := validateAdministratorPath(
+		directory,
+		info,
+		state.UID,
+		true,
+		backend.Root != "",
+	); err != nil {
+		return "", err
+	}
+	return directory, nil
+}
+
 func validPublicKey(value string) bool {
 	if len(value) > 16<<10 || strings.ContainsAny(value, "\r\x00") {
 		return false
@@ -1088,13 +1458,65 @@ func validPublicKey(value string) bool {
 	if len(fields) < 2 {
 		return false
 	}
+	blob, err := base64.StdEncoding.Strict().DecodeString(fields[1])
+	if err != nil || len(blob) == 0 || len(blob) > 16<<10 {
+		return false
+	}
+	keyType, rest, ok := readSSHWireString(blob)
+	if !ok || string(keyType) != fields[0] {
+		return false
+	}
 	switch fields[0] {
-	case "ssh-ed25519", "ssh-rsa", "ecdsa-sha2-nistp256",
-		"ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521":
-		return true
+	case "ssh-ed25519":
+		key, trailing, valid := readSSHWireString(rest)
+		return valid && len(key) == 32 && len(trailing) == 0
+	case "ssh-rsa":
+		exponent, rest, valid := readSSHWireString(rest)
+		if !valid || len(exponent) == 0 {
+			return false
+		}
+		modulus, trailing, valid := readSSHWireString(rest)
+		return valid && len(modulus) >= 128 && len(trailing) == 0
+	case "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521":
+		curve, rest, valid := readSSHWireString(rest)
+		if !valid || string(curve) != strings.TrimPrefix(fields[0], "ecdsa-sha2-") {
+			return false
+		}
+		point, trailing, valid := readSSHWireString(rest)
+		expectedLength := map[string]int{
+			"ecdsa-sha2-nistp256": 65,
+			"ecdsa-sha2-nistp384": 97,
+			"ecdsa-sha2-nistp521": 133,
+		}[fields[0]]
+		return valid && len(point) == expectedLength && point[0] == 4 &&
+			len(trailing) == 0
 	default:
 		return false
 	}
+}
+
+func readSSHWireString(input []byte) ([]byte, []byte, bool) {
+	if len(input) < 4 {
+		return nil, nil, false
+	}
+	length := binary.BigEndian.Uint32(input[:4])
+	if uint64(length) > uint64(len(input)-4) {
+		return nil, nil, false
+	}
+	end := 4 + int(length)
+	return input[4:end], input[end:], true
+}
+
+func firewallRulesEqual(actual []byte, expected []byte) bool {
+	normalize := func(input []byte) string {
+		replacer := strings.NewReplacer(
+			" ", "", "\t", "", "\r", "", "\n", "",
+			";", "",
+			"priorityfilter", "priority0",
+		)
+		return replacer.Replace(string(input))
+	}
+	return normalize(actual) == normalize(expected)
 }
 
 func (backend SystemBackend) desiredFile(item Item, profile Profile) (*managedFile, error) {
@@ -1182,6 +1604,16 @@ func (backend SystemBackend) desiredFile(item Item, profile Profile) (*managedFi
 
 func (backend SystemBackend) fileConverged(managed managedFile) (bool, error) {
 	target := backend.path(managed.Path)
+	if err := ensureNoManagedTransactionArtifacts(target); err != nil {
+		return false, err
+	}
+	return backend.managedFileContentConverged(managed)
+}
+
+func (backend SystemBackend) managedFileContentConverged(
+	managed managedFile,
+) (bool, error) {
+	target := backend.path(managed.Path)
 	info, err := os.Lstat(target)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -1192,6 +1624,14 @@ func (backend SystemBackend) fileConverged(managed managedFile) (bool, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() ||
 		runtime.GOOS != "windows" && info.Mode().Perm()&0o022 != 0 {
 		return false, fmt.Errorf("managed file %s is unsafe", managed.Path)
+	}
+	if err := validateManagedPath(
+		target,
+		info,
+		false,
+		backend.Root != "",
+	); err != nil {
+		return false, err
 	}
 	content, err := os.ReadFile(target) // #nosec G304 -- fixed managed path.
 	if err != nil {
@@ -1204,14 +1644,37 @@ func (backend SystemBackend) fileConverged(managed managedFile) (bool, error) {
 func (backend SystemBackend) activateManagedFile(
 	ctx context.Context,
 	managed managedFile,
+) error {
+	return backend.activateManagedFileWithPostVerify(ctx, managed, nil)
+}
+
+func (backend SystemBackend) activateManagedFileWithPostVerify(
+	ctx context.Context,
+	managed managedFile,
+	postVerify func() error,
 ) (returnErr error) {
 	target := backend.path(managed.Path)
-	if err := secureMkdirAll(filepath.Dir(target), 0o755); err != nil {
+	if err := ensureNoManagedTransactionArtifacts(target); err != nil {
+		return err
+	}
+	if err := secureMkdirAll(
+		filepath.Dir(target),
+		0o755,
+		backend.Root != "",
+	); err != nil {
 		return err
 	}
 	if info, err := os.Lstat(target); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return fmt.Errorf("managed path %s is unsafe", managed.Path)
+		}
+		if err := validateManagedPath(
+			target,
+			info,
+			false,
+			backend.Root != "",
+		); err != nil {
+			return err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -1273,11 +1736,31 @@ func (backend SystemBackend) activateManagedFile(
 			return backend.rollbackManaged(target, backup, hadTarget, err)
 		}
 	}
+	if postVerify != nil {
+		if err := postVerify(); err != nil {
+			return backend.rollbackManaged(target, backup, hadTarget, err)
+		}
+	}
 	if hadTarget {
 		if err := os.Remove(backup); err != nil {
 			return fmt.Errorf("remove rollback file: %w", err)
 		}
 		if err := syncDirectory(filepath.Dir(target)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureNoManagedTransactionArtifacts(target string) error {
+	for _, suffix := range []string{".stage", ".rollback"} {
+		artifact := target + suffix
+		if _, err := os.Lstat(artifact); err == nil {
+			return fmt.Errorf(
+				"stale managed transaction artifact %s requires recovery",
+				artifact,
+			)
+		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -1321,14 +1804,26 @@ func expandManagedSpec(spec execx.Spec, staged string, target string) execx.Spec
 	return output
 }
 
-func (backend SystemBackend) mergeLines(target string, additions []string, mode fs.FileMode) error {
-	if err := secureMkdirAll(filepath.Dir(target), 0o700); err != nil {
-		return err
-	}
+func (backend SystemBackend) mergeLines(
+	target string,
+	additions []string,
+	mode fs.FileMode,
+	state administratorState,
+) error {
 	existing := []byte{}
 	if info, err := os.Lstat(target); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() ||
+			runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 			return errors.New("authorized_keys target is unsafe")
+		}
+		if err := validateAdministratorPath(
+			target,
+			info,
+			state.UID,
+			false,
+			backend.Root != "",
+		); err != nil {
+			return err
 		}
 		existing, err = os.ReadFile(target) // #nosec G304 -- derived fixed user path.
 		if err != nil {
@@ -1347,7 +1842,63 @@ func (backend SystemBackend) mergeLines(target string, additions []string, mode 
 		}
 	}
 	content := []byte(strings.Join(lines, "\n") + "\n")
-	return writeFileAtomic(target, content, mode)
+	return writeFileAtomicForAdministrator(
+		target,
+		content,
+		mode,
+		state.UID,
+		state.GID,
+		backend.Root != "",
+	)
+}
+
+func writeFileAtomicForAdministrator(
+	target string,
+	content []byte,
+	mode fs.FileMode,
+	uid uint32,
+	gid uint32,
+	allowCurrentOwner bool,
+) (returnErr error) {
+	file, err := os.OpenFile(target+".stage", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	staged := file.Name()
+	defer func() {
+		if cleanupErr := os.Remove(staged); cleanupErr != nil &&
+			!errors.Is(cleanupErr, os.ErrNotExist) && returnErr == nil {
+			returnErr = cleanupErr
+		}
+	}()
+	if _, err := file.Write(content); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Chmod(mode); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := setOpenFileAdministratorOwner(
+		file,
+		uid,
+		gid,
+		allowCurrentOwner,
+	); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := replaceFile(staged, target); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(target))
 }
 
 func writeFileAtomic(target string, content []byte, mode fs.FileMode) (returnErr error) {
@@ -1383,7 +1934,11 @@ func writeFileAtomic(target string, content []byte, mode fs.FileMode) (returnErr
 	return syncDirectory(filepath.Dir(target))
 }
 
-func secureMkdirAll(directory string, mode fs.FileMode) error {
+func secureMkdirAll(
+	directory string,
+	mode fs.FileMode,
+	allowCurrentOwner ...bool,
+) error {
 	absolute, err := filepath.Abs(directory)
 	if err != nil {
 		return err
@@ -1391,6 +1946,7 @@ func secureMkdirAll(directory string, mode fs.FileMode) error {
 	volume := filepath.VolumeName(absolute)
 	current := volume + string(filepath.Separator)
 	relative := strings.TrimPrefix(absolute, current)
+	allowCurrent := len(allowCurrentOwner) > 0 && allowCurrentOwner[0]
 	for _, segment := range strings.Split(relative, string(filepath.Separator)) {
 		if segment == "" {
 			continue
@@ -1401,13 +1957,19 @@ func secureMkdirAll(directory string, mode fs.FileMode) error {
 			if err := os.Mkdir(current, mode); err != nil {
 				return err
 			}
-			continue
+			info, err = os.Lstat(current)
+			if err != nil {
+				return err
+			}
 		}
 		if err != nil {
 			return err
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			return fmt.Errorf("directory %s is unsafe", current)
+		}
+		if err := validateManagedPath(current, info, true, allowCurrent); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -69,7 +69,68 @@ jobs:
           go run ./tools/pluginregistry check-manifest \
             "${{ matrix.plugin }}" "${{ matrix.plugin }}_manifest-v1.json"
 
+  server-setup-os-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:10-slim
+            id: debian
+            version: "10"
+          - image: debian:11-slim
+            id: debian
+            version: "11"
+          - image: debian:12-slim
+            id: debian
+            version: "12"
+          - image: debian:13-slim
+            id: debian
+            version: "13"
+          - image: ubuntu:20.04
+            id: ubuntu
+            version: "20.04"
+          - image: ubuntu:22.04
+            id: ubuntu
+            version: "22.04"
+          - image: ubuntu:24.04
+            id: ubuntu
+            version: "24.04"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.0"
+          cache: true
+      - name: Build static server setup binary
+        run: >-
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath
+          -o server-setup-base_linux_amd64 ./cmd/server-setup-base
+      - name: Run plugin inside declared OS image
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          EXPECTED_ID: ${{ matrix.id }}
+          EXPECTED_VERSION: ${{ matrix.version }}
+        run: |
+          docker run --rm \
+            --volume "$PWD:/work:ro" \
+            --env EXPECTED_ID \
+            --env EXPECTED_VERSION \
+            "$IMAGE" sh -ceu '
+              . /etc/os-release
+              test "$ID" = "$EXPECTED_ID"
+              test "$VERSION_ID" = "$EXPECTED_VERSION"
+              /work/server-setup-base_linux_amd64 manifest --protocol=1 >/tmp/manifest.json
+              grep -q "\"name\":\"server-setup-base\"" /tmp/manifest.json
+              printf "%s\n" \
+                "{\"protocol_version\":1,\"request_id\":\"os-matrix\",\"command_path\":[\"setup\",\"check\"],\"arguments\":[],\"options\":{}}" |
+                /work/server-setup-base_linux_amd64 execute --protocol=1 >/tmp/result.json
+              grep -q "\"schema_version\":\"1.0\"" /tmp/result.json
+            '
+
   server-setup-readiness:
+    needs: server-setup-os-matrix
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -77,10 +138,6 @@ jobs:
         with:
           go-version: "1.26.0"
           cache: true
-      - name: Validate declared Debian and Ubuntu matrix
-        run: >-
-          go test -race -timeout=2m ./internal/serversetup
-          -run TestResolvePlatformAcceptsOnlyDeclaredMatrix -count=1
       - name: Run server setup readiness suite
         shell: bash
         run: |

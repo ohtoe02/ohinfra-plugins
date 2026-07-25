@@ -4,6 +4,6 @@ package serversetup
 
 import "os"
 
-func validateTrustedKeySource(string, os.FileInfo) error {
+func validateTrustedKeySource(string, os.FileInfo, ...bool) error {
 	return nil
 }

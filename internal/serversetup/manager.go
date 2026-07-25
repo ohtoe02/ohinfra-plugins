@@ -2,8 +2,13 @@ package serversetup
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
@@ -27,6 +32,10 @@ type Backend interface {
 	Observe(context.Context, Item, Profile) (Observation, error)
 	Apply(context.Context, Item, Profile) error
 	Verify(context.Context, Item, Profile) error
+}
+
+type DesiredStateMaterialProvider interface {
+	DesiredStateMaterial(context.Context, Profile) (map[string]string, error)
 }
 
 type Manager struct {
@@ -94,7 +103,7 @@ func (manager Manager) Check(ctx context.Context, requested []string) protocol.R
 				status = protocol.StatusWarning
 			}
 			checkStatus = protocol.StatusWarning
-			recommendation := "sudo ohtools setup apply " + string(item)
+			recommendation := "ohtools setup apply " + string(item)
 			recommendations = append(recommendations, recommendation)
 			summary += "; run " + recommendation
 		}
@@ -138,16 +147,17 @@ func (manager Manager) Plan(ctx context.Context, requested []string) (protocol.P
 		Config:   manager.Config,
 		Items:    append([]Item(nil), items...),
 	}
+	desiredStateSHA256, err := manager.desiredStateFingerprint(ctx, profile)
+	if err != nil {
+		return protocol.Plan{}, fmt.Errorf("fingerprint desired setup state: %w", err)
+	}
 	plan := protocol.Plan{
-		CommandID: "setup.apply",
-		Summary:   "Converge the selected server setup profile",
-		Checks:    []protocol.Check{},
-		Changes:   []protocol.Change{},
+		Summary: "Converge the selected server setup profile",
+		Checks:  []protocol.Check{},
+		Changes: []protocol.Change{},
 		Risks: []string{
 			"Configuration and package changes are applied to the local host",
 		},
-		RequiresRoot:         true,
-		RequiresConfirmation: true,
 	}
 	for _, item := range items {
 		observation, observeErr := manager.Backend.Observe(ctx, item, profile)
@@ -160,7 +170,11 @@ func (manager Manager) Plan(ctx context.Context, requested []string) (protocol.P
 		}
 		plan.Checks = append(plan.Checks, protocol.Check{
 			ID: "setup:" + string(item), Status: status,
-			Summary: observation.Summary, Details: observation.Details,
+			Summary: observation.Summary,
+			Details: withDesiredStateFingerprint(
+				observation.Details,
+				desiredStateSHA256,
+			),
 		})
 		if !observation.Converged {
 			plan.Changes = append(plan.Changes, protocol.Change{
@@ -181,6 +195,20 @@ func (manager Manager) Apply(ctx context.Context, approved protocol.Plan) (proto
 		Platform: manager.Platform,
 		Config:   manager.Config,
 		Items:    items,
+	}
+	approvedFingerprint, err := planDesiredStateFingerprint(approved)
+	if err != nil {
+		return protocol.Result{}, protocol.ExitError{Code: protocol.ExitArguments, Err: err}
+	}
+	currentFingerprint, err := manager.desiredStateFingerprint(ctx, profile)
+	if err != nil {
+		return protocol.Result{}, err
+	}
+	if approvedFingerprint != currentFingerprint {
+		return protocol.Result{}, protocol.ExitError{
+			Code: protocol.ExitArguments,
+			Err:  errors.New("approved setup plan no longer matches desired state"),
+		}
 	}
 	completed := make([]protocol.Change, 0, len(approved.Changes))
 	for _, change := range approved.Changes {
@@ -274,4 +302,95 @@ func changeReason(count int) string {
 		return "already_converged"
 	}
 	return "desired_state_applied"
+}
+
+func (manager Manager) desiredStateFingerprint(
+	ctx context.Context,
+	profile Profile,
+) (string, error) {
+	config := normalizedConfig(profile.Config)
+	material := map[string]string{}
+	if provider, ok := manager.Backend.(DesiredStateMaterialProvider); ok {
+		var err error
+		material, err = provider.DesiredStateMaterial(ctx, profile)
+		if err != nil {
+			return "", err
+		}
+	}
+	encoded, err := json.Marshal(struct {
+		Platform Platform          `json:"platform"`
+		Config   Config            `json:"config"`
+		Items    []Item            `json:"items"`
+		Material map[string]string `json:"material_sha256"`
+	}{
+		Platform: profile.Platform,
+		Config:   config,
+		Items:    append([]Item(nil), profile.Items...),
+		Material: material,
+	})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func normalizedConfig(input Config) Config {
+	output := input
+	output.EnabledItems = append([]string(nil), input.EnabledItems...)
+	output.Packages = append([]string(nil), input.Packages...)
+	slices.Sort(output.EnabledItems)
+	slices.Sort(output.Packages)
+	output.Administrators = append([]Administrator(nil), input.Administrators...)
+	for index := range output.Administrators {
+		output.Administrators[index].Groups = append(
+			[]string(nil),
+			output.Administrators[index].Groups...,
+		)
+		output.Administrators[index].AuthorizedKeySources = append(
+			[]string(nil),
+			output.Administrators[index].AuthorizedKeySources...,
+		)
+		slices.Sort(output.Administrators[index].Groups)
+		slices.Sort(output.Administrators[index].AuthorizedKeySources)
+	}
+	slices.SortFunc(output.Administrators, func(first, second Administrator) int {
+		return strings.Compare(first.Name, second.Name)
+	})
+	if input.Zabbix != nil {
+		zabbix := *input.Zabbix
+		output.Zabbix = &zabbix
+	}
+	return output
+}
+
+func withDesiredStateFingerprint(
+	input map[string]any,
+	fingerprint string,
+) map[string]any {
+	output := make(map[string]any, len(input)+1)
+	for key, value := range input {
+		output[key] = value
+	}
+	output["desired_state_sha256"] = fingerprint
+	return output
+}
+
+func planDesiredStateFingerprint(plan protocol.Plan) (string, error) {
+	fingerprint := ""
+	for _, check := range plan.Checks {
+		value, ok := check.Details["desired_state_sha256"].(string)
+		if !ok || len(value) != 64 {
+			return "", errors.New("approved setup plan lacks desired-state fingerprint")
+		}
+		if fingerprint == "" {
+			fingerprint = value
+		} else if fingerprint != value {
+			return "", errors.New("approved setup plan has inconsistent desired-state fingerprints")
+		}
+	}
+	if fingerprint == "" {
+		return "", errors.New("approved setup plan lacks checks")
+	}
+	return fingerprint, nil
 }

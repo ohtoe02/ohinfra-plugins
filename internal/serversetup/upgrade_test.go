@@ -2,6 +2,9 @@ package serversetup
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -48,10 +51,10 @@ func TestSystemBackendPlansAndAppliesOrdinaryUpgradeWithIsolatedIndexes(t *testi
 	if err := backend.ApplyUpgrade(context.Background(), profile, upgrades); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 4 {
+	if len(calls) != 3 {
 		t.Fatalf("calls = %#v", calls)
 	}
-	for _, call := range calls {
+	for _, call := range calls[:2] {
 		if call.Program != "apt-get" {
 			t.Fatalf("program = %q", call.Program)
 		}
@@ -59,10 +62,17 @@ func TestSystemBackendPlansAndAppliesOrdinaryUpgradeWithIsolatedIndexes(t *testi
 			t.Fatalf("apt call does not use isolated lists: %#v", call.Arguments)
 		}
 	}
-	if !containsArgument(calls[3].Arguments, "upgrade") ||
-		!containsArgument(calls[3].Arguments, "--with-new-pkgs") ||
-		!containsArgument(calls[3].Arguments, "-y") {
-		t.Fatalf("upgrade argv = %#v", calls[3].Arguments)
+	if calls[2].Program != "apt-get" || !reflect.DeepEqual(
+		calls[2].Arguments,
+		[]string{
+			"install", "-y", "--only-upgrade", "--no-remove", "--",
+			"curl=7.88.2",
+		},
+	) {
+		t.Fatalf("exact upgrade argv = %#v", calls[2])
+	}
+	if _, err := os.Stat(filepath.Join(root, "var", "cache", "ohtools", "server-setup", "apt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("planner left persistent APT state: %v", err)
 	}
 }
 
@@ -142,6 +152,14 @@ func (backend *memoryUpgradeBackend) ApplyUpgrade(
 ) error {
 	backend.applyCalls++
 	backend.upgrades = nil
+	return nil
+}
+
+func (backend *memoryUpgradeBackend) VerifyUpgrades(
+	_ context.Context,
+	_ Profile,
+	_ []PackageUpgrade,
+) error {
 	return nil
 }
 

@@ -8,9 +8,15 @@ import (
 	"syscall"
 )
 
-func validateTrustedKeySource(path string, info os.FileInfo) error {
+func validateTrustedKeySource(
+	path string,
+	info os.FileInfo,
+	allowCurrentOwner ...bool,
+) error {
 	metadata, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || metadata.Uid != 0 {
+	allowCurrent := len(allowCurrentOwner) > 0 && allowCurrentOwner[0]
+	if !ok || metadata.Uid != 0 &&
+		(!allowCurrent || metadata.Uid != uint32(os.Geteuid())) {
 		return fmt.Errorf("authorized key source %s must be owned by root", path)
 	}
 	return nil

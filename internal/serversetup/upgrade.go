@@ -25,6 +25,7 @@ type PackageUpgrade struct {
 type UpgradeBackend interface {
 	PlanUpgrade(context.Context, Profile) ([]PackageUpgrade, error)
 	ApplyUpgrade(context.Context, Profile, []PackageUpgrade) error
+	VerifyUpgrades(context.Context, Profile, []PackageUpgrade) error
 }
 
 var aptUpgradeLine = regexp.MustCompile(
@@ -70,21 +71,51 @@ func (backend SystemBackend) ApplyUpgrade(
 	if len(upgrades) == 0 {
 		return nil
 	}
-	return backend.withIsolatedAPT(ctx, func(options []string) error {
-		environment := map[string]string{"DEBIAN_FRONTEND": "noninteractive"}
-		update := append([]string{"update"}, options...)
-		if _, err := backend.run(ctx, execx.Spec{
-			Program: "apt-get", Arguments: update, Environment: environment,
-		}); err != nil {
-			return err
+	arguments := []string{"install", "-y", "--only-upgrade", "--no-remove", "--"}
+	for _, upgrade := range upgrades {
+		if !packageName.MatchString(upgrade.Name) || upgrade.CandidateVersion == "" ||
+			strings.ContainsAny(upgrade.CandidateVersion, "\x00\r\n\t ") {
+			return errors.New("approved package upgrade is invalid")
 		}
-		upgrade := []string{"upgrade", "-y", "--with-new-pkgs"}
-		upgrade = append(upgrade, options...)
-		_, err := backend.run(ctx, execx.Spec{
-			Program: "apt-get", Arguments: upgrade, Environment: environment,
-		})
-		return err
+		arguments = append(arguments, upgrade.Name+"="+upgrade.CandidateVersion)
+	}
+	_, err := backend.run(ctx, execx.Spec{
+		Program: "apt-get", Arguments: arguments,
+		Environment: map[string]string{"DEBIAN_FRONTEND": "noninteractive"},
 	})
+	return err
+}
+
+func (backend SystemBackend) VerifyUpgrades(
+	ctx context.Context,
+	_ Profile,
+	upgrades []PackageUpgrade,
+) error {
+	if len(upgrades) == 0 {
+		return nil
+	}
+	arguments := []string{"--show", "--showformat=${binary:Package}\\t${Version}\\n", "--"}
+	expected := make(map[string]string, len(upgrades))
+	for _, upgrade := range upgrades {
+		arguments = append(arguments, upgrade.Name)
+		expected[upgrade.Name] = upgrade.CandidateVersion
+	}
+	output, err := backend.run(ctx, execx.Spec{
+		Program: "dpkg-query", Arguments: arguments,
+	})
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(output.Stdout), "\n") {
+		name, version, found := strings.Cut(line, "\t")
+		if found && expected[name] == strings.TrimSpace(version) {
+			delete(expected, name)
+		}
+	}
+	if len(expected) != 0 {
+		return fmt.Errorf("%d approved package upgrade(s) were not installed exactly", len(expected))
+	}
+	return nil
 }
 
 func (backend SystemBackend) withIsolatedAPT(
@@ -96,11 +127,21 @@ func (backend SystemBackend) withIsolatedAPT(
 		return ctx.Err()
 	default:
 	}
-	base := backend.path("/var/cache/ohtools/server-setup/apt")
-	if err := secureMkdirAll(base, 0o700); err != nil {
+	base := backend.Root
+	if base == "" {
+		base = "/tmp"
+	}
+	info, err := os.Lstat(base)
+	if err != nil {
 		return err
 	}
-	runDirectory, err := os.MkdirTemp(base, "run-")
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("trusted temporary directory is unsafe")
+	}
+	if err := validateManagedPath(base, info, true, backend.Root != ""); err != nil {
+		return err
+	}
+	runDirectory, err := os.MkdirTemp(base, "ohtools-server-setup-apt-")
 	if err != nil {
 		return err
 	}
@@ -183,15 +224,12 @@ func (manager Manager) UpgradePlan(ctx context.Context) (protocol.Plan, error) {
 		return upgrades[first].Name < upgrades[second].Name
 	})
 	plan := protocol.Plan{
-		CommandID: "setup.upgrade",
-		Summary:   "Install available ordinary package upgrades",
-		Checks:    []protocol.Check{},
-		Changes:   []protocol.Change{},
+		Summary: "Install available ordinary package upgrades",
+		Checks:  []protocol.Check{},
+		Changes: []protocol.Change{},
 		Risks: []string{
 			"Package upgrades may restart services but never reboot the host",
 		},
-		RequiresRoot:         true,
-		RequiresConfirmation: true,
 	}
 	for _, upgrade := range upgrades {
 		plan.Changes = append(plan.Changes, protocol.Change{
@@ -252,8 +290,7 @@ func (manager Manager) Upgrade(
 			}), nil
 		}
 	}
-	remaining, err := backend.PlanUpgrade(ctx, profile)
-	if err != nil {
+	if err := backend.VerifyUpgrades(ctx, profile, upgrades); err != nil {
 		return normalizeResult(protocol.Result{
 			Command: "setup upgrade", Status: protocol.StatusPartial,
 			Timestamp:  manager.now().Format(time.RFC3339Nano),
@@ -261,18 +298,6 @@ func (manager Manager) Upgrade(
 			Host:       manager.Host, Tool: manager.Tool,
 			Errors: []protocol.StructuredError{{
 				Kind: protocol.ErrorGeneral, Code: "setup_upgrade_verify_failed", Message: err.Error(),
-			}},
-		}), nil
-	}
-	if len(remaining) > 0 {
-		return normalizeResult(protocol.Result{
-			Command: "setup upgrade", Status: protocol.StatusPartial,
-			Timestamp:  manager.now().Format(time.RFC3339Nano),
-			DurationMS: manager.now().Sub(started).Milliseconds(),
-			Host:       manager.Host, Tool: manager.Tool,
-			Errors: []protocol.StructuredError{{
-				Kind: protocol.ErrorGeneral, Code: "setup_upgrade_verify_failed",
-				Message: fmt.Sprintf("%d package upgrade(s) remain", len(remaining)),
 			}},
 		}), nil
 	}

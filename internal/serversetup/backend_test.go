@@ -3,6 +3,8 @@ package serversetup
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -90,6 +92,77 @@ func TestSystemBackendRestoresOwnedFileWhenActivationFails(t *testing.T) {
 	}
 	if string(content) != "# previous\n" {
 		t.Fatalf("rollback content = %q", content)
+	}
+}
+
+func TestSystemBackendRollsBackWhenPostVerificationFails(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	target := filepath.Join(root, "etc", "sysctl.d", "60-ohtools-server-setup.conf")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previous := []byte("# previous\n")
+	if err := os.WriteFile(target, previous, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			if spec.Program == "sysctl" {
+				if err := os.WriteFile(target, []byte("# rejected effective state\n"), 0o644); err != nil {
+					return execx.Output{}, err
+				}
+			}
+			return execx.Output{}, nil
+		}),
+	}
+	err := backend.Apply(context.Background(), ItemSysctl, Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   DefaultConfig(),
+		Items:    []Item{ItemPackages, ItemSysctl},
+	})
+	if err == nil {
+		t.Fatal("post-verification drift was ignored")
+	}
+	content, readErr := os.ReadFile(target)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !reflect.DeepEqual(content, previous) {
+		t.Fatalf("post-verification rollback content = %q", content)
+	}
+}
+
+func TestSystemBackendFailsClosedOnStaleManagedTransactionArtifact(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	target := filepath.Join(root, "etc", "sysctl.d", "60-ohtools-server-setup.conf")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backend := SystemBackend{Root: root, Runner: successfulRunner()}
+	managed, err := backend.desiredFile(ItemSysctl, Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   DefaultConfig(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, managed.Content, managed.Mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target+".rollback", []byte("# previous\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = backend.Observe(context.Background(), ItemSysctl, Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   DefaultConfig(),
+	})
+	if err == nil {
+		t.Fatal("stale managed transaction artifact was ignored")
 	}
 }
 
@@ -331,8 +404,12 @@ func TestSystemBackendRepairsOnlyMissingAdministratorGroups(t *testing.T) {
 
 	groups := []string{"operator", "sudo"}
 	var calls []execx.Spec
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "home", "operator"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	backend := SystemBackend{
-		Root: t.TempDir(),
+		Root: root,
 		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
 			calls = append(calls, spec)
 			switch {
@@ -340,6 +417,10 @@ func TestSystemBackendRepairsOnlyMissingAdministratorGroups(t *testing.T) {
 				return execx.Output{Stdout: []byte("1000\n")}, nil
 			case spec.Program == "id" && containsArgument(spec.Arguments, "-nG"):
 				return execx.Output{Stdout: []byte(strings.Join(groups, " ") + "\n")}, nil
+			case spec.Program == "getent":
+				return execx.Output{Stdout: []byte(
+					"operator:x:1000:1000:Operator:/home/operator:/bin/bash\n",
+				)}, nil
 			case spec.Program == "usermod":
 				groups = append(groups, "adm")
 				return execx.Output{}, nil
@@ -392,20 +473,28 @@ func TestSystemBackendObservesAndInstallsAuthorizedKeysUnderInjectedRoot(t *test
 	if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	key := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureKey operator@example"
+	key := validEd25519PublicKey("operator@example")
 	if err := os.WriteFile(source, []byte(key+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "home", "operator"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	backend := SystemBackend{
 		Root: root,
 		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
-			if spec.Program != "id" {
-				return execx.Output{}, errors.New("unexpected command")
+			if spec.Program == "getent" {
+				return execx.Output{Stdout: []byte(
+					"operator:x:1000:1000:Operator:/home/operator:/bin/bash\n",
+				)}, nil
 			}
-			if containsArgument(spec.Arguments, "-u") {
+			if spec.Program == "id" && containsArgument(spec.Arguments, "-u") {
 				return execx.Output{Stdout: []byte("1000\n")}, nil
 			}
-			return execx.Output{Stdout: []byte("operator sudo\n")}, nil
+			if spec.Program == "id" {
+				return execx.Output{Stdout: []byte("operator sudo\n")}, nil
+			}
+			return execx.Output{}, errors.New("unexpected command")
 		}),
 	}
 	config := DefaultConfig()
@@ -440,6 +529,318 @@ func TestSystemBackendObservesAndInstallsAuthorizedKeysUnderInjectedRoot(t *test
 	}
 	if string(content) != key+"\n" {
 		t.Fatalf("authorized_keys = %q", content)
+	}
+}
+
+func TestSystemBackendRejectsMalformedAuthorizedKeyBeforeSSHHardening(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	source := filepath.Join(root, "etc", "ohtools", "plugins", "keys", "operator.pub")
+	if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("ssh-ed25519 not-base64 operator\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "home", "operator"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			if output, ok := usableAdministratorOutput(spec); ok {
+				return output, nil
+			}
+			return execx.Output{}, nil
+		}),
+	}
+	config := DefaultConfig()
+	config.Administrators = []Administrator{{
+		Name: "operator", Groups: []string{"sudo"},
+		AuthorizedKeySources: []string{"/etc/ohtools/plugins/keys/operator.pub"},
+	}}
+	_, err := backend.Observe(context.Background(), ItemUsers, Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemUsers, ItemSSH},
+	})
+	if err == nil {
+		t.Fatal("malformed SSH public key was accepted")
+	}
+}
+
+func TestSystemBackendRejectsAdministratorWithNonLoginShell(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	key := validEd25519PublicKey("operator@example")
+	source := filepath.Join(root, "etc", "ohtools", "plugins", "keys", "operator.pub")
+	target := filepath.Join(root, "home", "operator", ".ssh", "authorized_keys")
+	for _, directory := range []string{filepath.Dir(source), filepath.Dir(target)} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(source, []byte(key+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(key+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			switch {
+			case spec.Program == "id" && containsArgument(spec.Arguments, "-u"):
+				return execx.Output{Stdout: []byte("1000\n")}, nil
+			case spec.Program == "id":
+				return execx.Output{Stdout: []byte("operator sudo\n")}, nil
+			case spec.Program == "getent":
+				return execx.Output{Stdout: []byte(
+					"operator:x:1000:1000:Operator:/home/operator:/usr/sbin/nologin\n",
+				)}, nil
+			default:
+				return execx.Output{}, nil
+			}
+		}),
+	}
+	config := DefaultConfig()
+	config.Administrators = []Administrator{{
+		Name: "operator", Groups: []string{"sudo"},
+		AuthorizedKeySources: []string{"/etc/ohtools/plugins/keys/operator.pub"},
+	}}
+	_, err := backend.Observe(context.Background(), ItemUsers, Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemUsers, ItemSSH},
+	})
+	if err == nil {
+		t.Fatal("administrator with non-login shell was accepted")
+	}
+}
+
+func TestSystemBackendRejectsAdministratorWithMissingHomeDirectory(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			switch {
+			case spec.Program == "id" && containsArgument(spec.Arguments, "-u"):
+				return execx.Output{Stdout: []byte("1000\n")}, nil
+			case spec.Program == "getent":
+				return execx.Output{Stdout: []byte(
+					"operator:x:1000:1000:Operator:/home/operator:/bin/bash\n",
+				)}, nil
+			default:
+				return execx.Output{}, nil
+			}
+		}),
+	}
+	config := DefaultConfig()
+	config.Administrators = []Administrator{{Name: "operator"}}
+	_, err := backend.Observe(context.Background(), ItemUsers, Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemUsers},
+	})
+	if err == nil {
+		t.Fatal("administrator with a missing home directory was accepted")
+	}
+}
+
+func TestFirewallObservationRejectsWrongActivePort(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			switch {
+			case spec.Program == "systemctl":
+				return execx.Output{}, nil
+			case spec.Program == "nft" && containsArgument(spec.Arguments, "list"):
+				return execx.Output{Stdout: []byte(
+					"table inet ohtools_server_setup { chain input { type filter hook input priority 0; policy accept; tcp dport 22 accept; } }\n",
+				)}, nil
+			default:
+				return execx.Output{}, nil
+			}
+		}),
+	}
+	config := DefaultConfig()
+	config.SSHPort = 2222
+	config.ManageFirewall = true
+	profile := Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemFirewall},
+	}
+	for _, managed := range mustFirewallFiles(t, backend, profile) {
+		target := backend.path(managed.Path)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, managed.Content, managed.Mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	observation, err := backend.Observe(context.Background(), ItemFirewall, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Converged {
+		t.Fatal("firewall with the wrong active SSH port was accepted")
+	}
+}
+
+func TestFirewallRollbackRestoresActiveRulesAndEnablement(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	oldConfig := DefaultConfig()
+	oldConfig.ManageFirewall = true
+	oldProfile := Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   oldConfig,
+		Items:    []Item{ItemPackages, ItemFirewall},
+	}
+	enabled := false
+	activeRules := append([]byte(nil), mustFirewallFiles(
+		t,
+		SystemBackend{Root: root},
+		oldProfile,
+	)[0].Content...)
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			switch {
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-enabled"):
+				if enabled {
+					return execx.Output{}, nil
+				}
+				return execx.Output{ExitCode: 1}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "enable"):
+				enabled = true
+				return execx.Output{}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "disable"):
+				enabled = false
+				return execx.Output{}, nil
+			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "restart"):
+				activeRules = nil
+				return execx.Output{ExitCode: 1, Stderr: []byte("restart failed")}, nil
+			case spec.Program == "systemctl":
+				return execx.Output{}, nil
+			case spec.Program == "nft" && containsArgument(spec.Arguments, "list"):
+				if len(activeRules) == 0 {
+					return execx.Output{ExitCode: 1}, nil
+				}
+				return execx.Output{Stdout: append([]byte(nil), activeRules...)}, nil
+			case spec.Program == "nft" && containsArgument(spec.Arguments, "-c"):
+				return execx.Output{}, nil
+			case spec.Program == "nft" && containsArgument(spec.Arguments, "-f"):
+				if len(spec.Stdin) > 0 {
+					activeRules = append([]byte(nil), spec.Stdin...)
+					return execx.Output{}, nil
+				}
+				return execx.Output{}, errors.New("nft restore path is missing")
+			case spec.Program == "nft" && containsArgument(spec.Arguments, "delete"):
+				activeRules = nil
+				return execx.Output{}, nil
+			default:
+				return execx.Output{}, nil
+			}
+		}),
+	}
+	for _, managed := range mustFirewallFiles(t, backend, oldProfile) {
+		target := backend.path(managed.Path)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, managed.Content, managed.Mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newConfig := oldConfig
+	newConfig.SSHPort = 2222
+	err := backend.Apply(context.Background(), ItemFirewall, Profile{
+		Platform: oldProfile.Platform,
+		Config:   newConfig,
+		Items:    oldProfile.Items,
+	})
+	if err == nil {
+		t.Fatal("firewall restart failure was ignored")
+	}
+	if enabled {
+		t.Fatal("firewall service enablement was not rolled back")
+	}
+	if !firewallRulesEqual(activeRules, mustFirewallFiles(t, backend, oldProfile)[0].Content) {
+		t.Fatalf("active firewall rules were not restored: %q", activeRules)
+	}
+}
+
+func mustFirewallFiles(t *testing.T, backend SystemBackend, profile Profile) []managedFile {
+	t.Helper()
+	files, err := backend.firewallFiles(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
+}
+
+func validEd25519PublicKey(comment string) string {
+	return validEd25519PublicKeyWithSeed(comment, 1)
+}
+
+func validEd25519PublicKeyWithSeed(comment string, seed byte) string {
+	keyType := []byte("ssh-ed25519")
+	public := make([]byte, 32)
+	for index := range public {
+		public[index] = byte(index) + seed
+	}
+	blob := make([]byte, 0, 4+len(keyType)+4+len(public))
+	blob = binary.BigEndian.AppendUint32(blob, uint32(len(keyType)))
+	blob = append(blob, keyType...)
+	blob = binary.BigEndian.AppendUint32(blob, uint32(len(public)))
+	blob = append(blob, public...)
+	return "ssh-ed25519 " + base64.StdEncoding.EncodeToString(blob) + " " + comment
+}
+
+func prepareUsableSSHAdministrator(t *testing.T, root string) Administrator {
+	t.Helper()
+	key := validEd25519PublicKey("operator@example")
+	source := filepath.Join(root, "etc", "ohtools", "plugins", "keys", "operator.pub")
+	target := filepath.Join(root, "home", "operator", ".ssh", "authorized_keys")
+	for _, directory := range []string{filepath.Dir(source), filepath.Dir(target)} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{source, target} {
+		if err := os.WriteFile(path, []byte(key+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return Administrator{
+		Name: "operator", Groups: []string{"sudo"},
+		AuthorizedKeySources: []string{"/etc/ohtools/plugins/keys/operator.pub"},
+	}
+}
+
+func usableAdministratorOutput(spec execx.Spec) (execx.Output, bool) {
+	switch {
+	case spec.Program == "id" && containsArgument(spec.Arguments, "-u"):
+		return execx.Output{Stdout: []byte("1000\n")}, true
+	case spec.Program == "id":
+		return execx.Output{Stdout: []byte("operator sudo\n")}, true
+	case spec.Program == "getent":
+		return execx.Output{Stdout: []byte(
+			"operator:x:1000:1000:Operator:/home/operator:/bin/bash\n",
+		)}, true
+	default:
+		return execx.Output{}, false
 	}
 }
 
@@ -502,6 +903,9 @@ func TestSystemBackendAddsEarlySSHIncludeAndVerifiesEffectiveState(t *testing.T)
 		Root: root,
 		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
 			calls = append(calls, spec)
+			if output, ok := usableAdministratorOutput(spec); ok {
+				return output, nil
+			}
 			if spec.Program == "sshd" && containsArgument(spec.Arguments, "-T") {
 				return execx.Output{Stdout: []byte(
 					"port 2222\n" +
@@ -517,12 +921,7 @@ func TestSystemBackendAddsEarlySSHIncludeAndVerifiesEffectiveState(t *testing.T)
 	config := DefaultConfig()
 	config.SSHPort = 2222
 	config.ManageFirewall = true
-	config.Administrators = []Administrator{{
-		Name: "operator",
-		AuthorizedKeySources: []string{
-			"/etc/ohtools/plugins/keys/operator.pub",
-		},
-	}}
+	config.Administrators = []Administrator{prepareUsableSSHAdministrator(t, root)}
 	profile := Profile{
 		Platform: Platform{ID: "debian", Version: "10"},
 		Config:   config,
@@ -555,6 +954,59 @@ func TestSystemBackendAddsEarlySSHIncludeAndVerifiesEffectiveState(t *testing.T)
 	}
 }
 
+func TestSystemBackendBlocksSSHHardeningUntilAdministratorKeyIsUsable(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	mainConfig := filepath.Join(root, "etc", "ssh", "sshd_config")
+	if err := os.MkdirAll(filepath.Dir(mainConfig), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mainConfig, []byte("# vendor configuration\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reloads := 0
+	backend := SystemBackend{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			if spec.Program == "id" {
+				return execx.Output{ExitCode: 1}, nil
+			}
+			if spec.Program == "sshd" && containsArgument(spec.Arguments, "-T") {
+				return execx.Output{Stdout: []byte(
+					"port 22\n" +
+						"permitrootlogin prohibit-password\n" +
+						"passwordauthentication no\n" +
+						"kbdinteractiveauthentication no\n" +
+						"pubkeyauthentication yes\n",
+				)}, nil
+			}
+			if spec.Program == "systemctl" {
+				reloads++
+			}
+			return execx.Output{}, nil
+		}),
+	}
+	config := DefaultConfig()
+	config.Administrators = []Administrator{{
+		Name: "operator",
+		AuthorizedKeySources: []string{
+			"/etc/ohtools/plugins/keys/operator.pub",
+		},
+	}}
+	err := backend.Apply(context.Background(), ItemSSH, Profile{
+		Platform: Platform{ID: "debian", Version: "12"},
+		Config:   config,
+		Items:    []Item{ItemPackages, ItemUsers, ItemSSH},
+	})
+	if err == nil {
+		t.Fatal("SSH hardening accepted an unavailable administrator key")
+	}
+	if reloads != 0 {
+		t.Fatalf("SSH was reloaded before administrator access validation: %d", reloads)
+	}
+}
+
 func TestSystemBackendRollsBackSSHIncludeWhenActivationFails(t *testing.T) {
 	t.Parallel()
 
@@ -570,6 +1022,9 @@ func TestSystemBackendRollsBackSSHIncludeWhenActivationFails(t *testing.T) {
 	backend := SystemBackend{
 		Root: root,
 		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			if output, ok := usableAdministratorOutput(spec); ok {
+				return output, nil
+			}
 			if spec.Program == "sshd" && containsArgument(spec.Arguments, "-T") {
 				return execx.Output{Stdout: []byte(
 					"port 22\n" +
@@ -586,12 +1041,7 @@ func TestSystemBackendRollsBackSSHIncludeWhenActivationFails(t *testing.T) {
 		}),
 	}
 	config := DefaultConfig()
-	config.Administrators = []Administrator{{
-		Name: "operator",
-		AuthorizedKeySources: []string{
-			"/etc/ohtools/plugins/keys/operator.pub",
-		},
-	}}
+	config.Administrators = []Administrator{prepareUsableSSHAdministrator(t, root)}
 	err := backend.Apply(context.Background(), ItemSSH, Profile{
 		Platform: Platform{ID: "debian", Version: "10"},
 		Config:   config,
@@ -636,6 +1086,9 @@ func TestSystemBackendBlocksForeignSSHConflictBeforeReload(t *testing.T) {
 	backend := SystemBackend{
 		Root: root,
 		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			if output, ok := usableAdministratorOutput(spec); ok {
+				return output, nil
+			}
 			if spec.Program == "sshd" && containsArgument(spec.Arguments, "-T") {
 				return execx.Output{Stdout: []byte(
 					"port 22\n" +
@@ -652,12 +1105,7 @@ func TestSystemBackendBlocksForeignSSHConflictBeforeReload(t *testing.T) {
 		}),
 	}
 	config := DefaultConfig()
-	config.Administrators = []Administrator{{
-		Name: "operator",
-		AuthorizedKeySources: []string{
-			"/etc/ohtools/plugins/keys/operator.pub",
-		},
-	}}
+	config.Administrators = []Administrator{prepareUsableSSHAdministrator(t, root)}
 	err := backend.Apply(context.Background(), ItemSSH, Profile{
 		Platform: Platform{ID: "debian", Version: "12"},
 		Config:   config,
@@ -695,7 +1143,9 @@ func TestSystemBackendPersistsFirewallWithoutSecondUpdate(t *testing.T) {
 				return execx.Output{}, nil
 			case spec.Program == "nft" && containsArgument(spec.Arguments, "list"):
 				if active {
-					return execx.Output{}, nil
+					return execx.Output{Stdout: []byte(
+						"table inet ohtools_server_setup {\n chain input { type filter hook input priority 0; policy accept; tcp dport 22 accept; }\n}\n",
+					)}, nil
 				}
 				return execx.Output{ExitCode: 1}, nil
 			case spec.Program == "systemctl" && containsArgument(spec.Arguments, "is-enabled"):

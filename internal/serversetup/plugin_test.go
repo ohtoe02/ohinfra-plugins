@@ -3,6 +3,7 @@ package serversetup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -161,5 +162,56 @@ func TestDefinitionRejectsStaleApplyDigestBeforeMutation(t *testing.T) {
 	}
 	if len(backend.applied) != 0 {
 		t.Fatalf("stale plan mutated backend: %#v", backend.applied)
+	}
+}
+
+func TestDefinitionRejectsConfigurationDriftWithSameObservedState(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "server-setup-base.yaml")
+	writeConfig := func(port int) {
+		t.Helper()
+		if err := os.WriteFile(configPath, []byte(fmt.Sprintf(
+			"ssh_port: %d\nmanage_firewall: true\nadministrators:\n"+
+				"  - name: operator\n"+
+				"    authorized_key_sources: [/etc/ohtools/plugins/keys/operator.pub]\n",
+			port,
+		)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConfig(22)
+	platform := Platform{ID: "debian", Version: "12"}
+	backend := &memoryBackend{drift: map[Item]bool{
+		ItemPackages: true, ItemUsers: true, ItemFirewall: true, ItemSSH: true,
+	}}
+	definition := NewDefinition(Options{
+		Version: "1.0.0", ConfigPath: configPath,
+		Platform: &platform, Backend: backend,
+	})
+	invocation := protocol.Invocation{
+		ProtocolVersion: protocol.ProtocolVersion,
+		RequestID:       "configuration-drift",
+		CommandPath:     []string{"setup", "apply"},
+		Arguments:       []string{"ssh"},
+		Options:         map[string]any{},
+	}
+	plan, err := definition.Plan(context.Background(), invocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := protocol.PlanDigest(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeConfig(2222)
+	invocation.PlanDigest = digest
+	_, err = definition.Execute(context.Background(), invocation)
+	var exitError protocol.ExitError
+	if !errors.As(err, &exitError) || exitError.Code != protocol.ExitArguments {
+		t.Fatalf("Execute() error = %#v, want stale-plan argument failure", err)
+	}
+	if len(backend.applied) != 0 {
+		t.Fatalf("configuration drift mutated backend: %#v", backend.applied)
 	}
 }

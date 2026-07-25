@@ -9,7 +9,48 @@ permissions:
   contents: write
 
 jobs:
+  server-setup-readiness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: startsWith(github.ref_name, 'server-setup-base-v')
+        with:
+          go-version: "1.26.0"
+          cache: true
+      - name: Run release-blocking server setup readiness
+        if: startsWith(github.ref_name, 'server-setup-base-v')
+        shell: bash
+        run: |
+          go test -race -timeout=5m ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -o server-setup-base_linux_amd64 ./cmd/server-setup-base
+          while IFS='|' read -r image expected_id expected_version; do
+            docker run --rm \
+              --volume "$PWD:/work:ro" \
+              --env EXPECTED_ID="$expected_id" \
+              --env EXPECTED_VERSION="$expected_version" \
+              "$image" sh -ceu '
+                . /etc/os-release
+                test "$ID" = "$EXPECTED_ID"
+                test "$VERSION_ID" = "$EXPECTED_VERSION"
+                printf "%s\n" \
+                  "{\"protocol_version\":1,\"request_id\":\"release-readiness\",\"command_path\":[\"setup\",\"check\"],\"arguments\":[],\"options\":{}}" |
+                  /work/server-setup-base_linux_amd64 execute --protocol=1 >/tmp/result.json
+                grep -q "\"schema_version\":\"1.0\"" /tmp/result.json
+              '
+          done <<'EOF'
+          debian:10-slim|debian|10
+          debian:11-slim|debian|11
+          debian:12-slim|debian|12
+          debian:13-slim|debian|13
+          ubuntu:20.04|ubuntu|20.04
+          ubuntu:22.04|ubuntu|22.04
+          ubuntu:24.04|ubuntu|24.04
+          EOF
+
   release:
+    needs: server-setup-readiness
     runs-on: ubuntu-latest
     environment: production
     steps:
