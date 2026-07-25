@@ -209,30 +209,42 @@ func TestLoadRejectsSymlinkedReleaseCommand(t *testing.T) {
 	}
 }
 
-func TestReleaseWorkflowRefusesToOverwritePublishedAssets(t *testing.T) {
+func TestReleaseWorkflowUsesResumableImmutableDraftPublisher(t *testing.T) {
 	workflow, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	content := string(workflow)
 	for _, required := range []string{
-		`gh release create "${GITHUB_REF_NAME}"`,
-		"--verify-tag",
-		"--draft",
-		`gh release upload "${GITHUB_REF_NAME}"`,
-		`gh release edit "${GITHUB_REF_NAME}" --draft=false`,
+		`RELEASE_COMMIT="$(git rev-parse --verify "${GITHUB_REF_NAME}^{commit}")"`,
+		"go run ./tools/releasepublish",
+		`--repo "${GITHUB_REPOSITORY}"`,
+		`--tag "${GITHUB_REF_NAME}"`,
+		`--commit "${RELEASE_COMMIT}"`,
+		`main.commit=${RELEASE_COMMIT}`,
+		`--asset "dist/${PLUGIN}_linux_amd64"`,
+		`--asset "dist/${PLUGIN}_linux_amd64.sha256"`,
+		`--asset "dist/${PLUGIN}_linux_amd64.spdx.json"`,
+		`--asset "dist/${PLUGIN}_manifest-v1.json"`,
+		`--asset "dist/${PLUGIN}_release-metadata-v1.json"`,
+		`BUILD_DATE="$(git for-each-ref --format='%(taggerdate:iso-strict)' "refs/tags/${GITHUB_REF_NAME}")"`,
+		`test -n "${BUILD_DATE}"`,
+		"go run ./tools/sbomnormalize",
 	} {
 		if !strings.Contains(content, required) {
-			t.Errorf("release workflow lacks fail-closed immutability guard %q", required)
+			t.Errorf("release workflow lacks resumable publisher input %q", required)
 		}
 	}
 	for _, forbidden := range []string{
-		`gh release view "${GITHUB_REF_NAME}"`,
+		"gh release create",
+		"gh release upload",
+		"gh release edit",
 		"softprops/action-gh-release",
 		"--clobber",
+		"BUILD_DATE=$(date ",
 	} {
 		if strings.Contains(content, forbidden) {
-			t.Errorf("release workflow retains non-atomic or clobbering path %q", forbidden)
+			t.Errorf("release workflow bypasses the immutable publisher with %q", forbidden)
 		}
 	}
 }
