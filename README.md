@@ -8,6 +8,10 @@ Plugin package names are visible in the catalog and management commands. They
 do not alter operator-facing CLI paths: `docker-base`, for example, provides
 `ohtools docker ...` and `ohtools compose ...`.
 
+Browse the bilingual documentation, declarative module reference, and verified
+plugin catalog in the public
+[ohtools developer portal](https://ohtoe02.github.io/ohtools-web/).
+
 ## Production plugins
 
 | Package | CLI namespaces | Current commands |
