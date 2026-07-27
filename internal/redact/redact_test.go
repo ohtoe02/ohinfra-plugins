@@ -27,3 +27,28 @@ func TestRecursiveRedactionMasksSecrets(t *testing.T) {
 		t.Fatalf("safe value changed: %#v", got.Data["safe"])
 	}
 }
+
+func TestValueRedactsTypedNestedContainersWithoutChangingTheirTypes(t *testing.T) {
+	input := []map[string]any{{
+		"name":  "first",
+		"token": "top-secret",
+		"metadata": map[string]string{
+			"safe":     "visible",
+			"password": "nested-secret",
+		},
+	}}
+
+	got := Value(input).([]map[string]any)
+	metadata := got[0]["metadata"].(map[string]string)
+
+	if got[0]["token"] != Mask || metadata["password"] != Mask {
+		t.Fatalf("typed secrets were not redacted: %#v", got)
+	}
+	if got[0]["name"] != "first" || metadata["safe"] != "visible" {
+		t.Fatalf("safe values changed: %#v", got)
+	}
+	if input[0]["token"] != "top-secret" ||
+		input[0]["metadata"].(map[string]string)["password"] != "nested-secret" {
+		t.Fatalf("Value mutated input: %#v", input)
+	}
+}
