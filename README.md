@@ -24,9 +24,11 @@ do not alter operator-facing CLI paths: `docker-base`, for example, provides
 | `postgres-base` | `postgres` | Local installation, cluster, and configuration diagnostics | `1.0.0 planned` |
 | `k8s-base` | `k8s` | Local client, kubelet, kubeconfig, and static manifest diagnostics | `1.0.0 planned` |
 | `java-base` | `java` | Local runtime, process, and bounded `jcmd` diagnostics | `1.0.0 planned` |
+| `kafka-base` | `kafka` | Local installation, configuration, and storage diagnostics | `1.0.0 planned` |
+| `gitlab-runner-base` | `gitlab-runner` | Local service, safe configuration, and executor diagnostics | `1.0.0 planned` |
+| `monitoring-base` | `monitoring` | Local monitoring product inventory and configuration metadata | `1.0.0 planned` |
 
-The roadmap also reserves `kafka-base`, `gitlab-runner-base`,
-`monitoring-base`, `backup-base`, `incident-base`, and `runbook-base`.
+The roadmap also reserves `backup-base`, `incident-base`, and `runbook-base`.
 `inventory-base` remains deferred. A package is not published to the catalog
 until it has a complete implementation, security tests, and immutable release
 assets.
