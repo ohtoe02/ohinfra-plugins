@@ -104,6 +104,9 @@ type OSRunner struct {
 }
 
 func (runner OSRunner) Run(ctx context.Context, spec Spec) (Output, error) {
+	if err := ctx.Err(); err != nil {
+		return Output{}, err
+	}
 	path, err := runner.Resolver.Resolve(spec.Program)
 	if err != nil {
 		return Output{}, err
