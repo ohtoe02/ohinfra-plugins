@@ -146,6 +146,10 @@ func sanitizeURI(raw string) string {
 		return "[invalid-uri]"
 	}
 	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
 	return parsed.String()
 }
 

@@ -41,7 +41,7 @@ func runChecks(
 		case "kernel-controls":
 			outcome = kernelControlsCheck(local)
 		case "ssh-posture":
-			outcome = sshPostureCheck(local)
+			outcome = sshPostureCheck(ctx, local)
 		case "package-state":
 			outcome = packageStateCheck(local, settings.MaxPendingPackageRecords)
 		case "required-services":
@@ -74,7 +74,14 @@ func timeSyncCheck(ctx context.Context, local probe.Local) checkOutcome {
 	if err != nil {
 		return unavailableCheck("time-sync", "timedatectl", err)
 	}
-	synced := output.ExitCode == 0 && strings.EqualFold(strings.TrimSpace(string(output.Stdout)), "yes")
+	if output.ExitCode != 0 {
+		return unavailableCheck(
+			"time-sync",
+			"timedatectl",
+			errors.New("timedatectl returned a nonzero exit code"),
+		)
+	}
+	synced := strings.EqualFold(strings.TrimSpace(string(output.Stdout)), "yes")
 	status, summary := protocol.StatusPass, "System time synchronization is active"
 	if !synced {
 		status, summary = protocol.StatusWarning, "System time synchronization is not active"
@@ -105,20 +112,53 @@ func filesystemOwnershipCheck(local probe.Local) checkOutcome {
 }
 
 func kernelControlsCheck(local probe.Local) checkOutcome {
-	expected := map[string]string{
-		"proc/sys/kernel/randomize_va_space":   "2",
-		"proc/sys/net/ipv4/conf/all/rp_filter": "1",
+	expected := []struct {
+		path  string
+		value string
+	}{
+		{path: "proc/sys/kernel/randomize_va_space", value: "2"},
+		{path: "proc/sys/net/ipv4/conf/all/rp_filter", value: "1"},
 	}
-	for relative, want := range expected {
-		encoded, err := local.Read(relative, 64)
+	findings := []map[string]any{}
+	unavailable := []string{}
+	mismatched := false
+	for _, control := range expected {
+		encoded, err := local.Read(control.path, 64)
 		if err != nil {
-			return localInspectionError("kernel-controls", "Required kernel controls are unavailable")
+			unavailable = append(unavailable, control.path)
+			findings = append(findings, map[string]any{
+				"path": control.path, "status": "unavailable",
+			})
+			continue
 		}
-		if strings.TrimSpace(string(encoded)) != want {
-			return checkOutcome{check: protocol.Check{
-				ID: "baseline:kernel-controls", Status: protocol.StatusWarning,
-				Summary: "One or more compiled kernel controls differ from the baseline",
-			}}
+		actual := strings.TrimSpace(string(encoded))
+		if actual != control.value {
+			mismatched = true
+			findings = append(findings, map[string]any{
+				"path": control.path, "status": "mismatch",
+				"expected": control.value, "actual": actual,
+			})
+		}
+	}
+	if mismatched {
+		outcome := checkOutcome{check: protocol.Check{
+			ID: "baseline:kernel-controls", Status: protocol.StatusWarning,
+			Summary: "One or more compiled kernel controls differ from the baseline",
+			Details: map[string]any{"findings": findings},
+		}}
+		if len(unavailable) > 0 {
+			outcome.err = kernelControlsUnavailableError(unavailable)
+		}
+		return outcome
+	}
+	if len(unavailable) > 0 {
+		return checkOutcome{
+			check: protocol.Check{
+				ID: "baseline:kernel-controls", Status: protocol.StatusSkipped,
+				Summary: "The compiled local check could not be completed",
+				Details: map[string]any{"findings": findings},
+			},
+			err: kernelControlsUnavailableError(unavailable),
 		}
 	}
 	return checkOutcome{check: protocol.Check{
@@ -127,14 +167,36 @@ func kernelControlsCheck(local probe.Local) checkOutcome {
 	}}
 }
 
-func sshPostureCheck(local probe.Local) checkOutcome {
-	encoded, err := local.Read("etc/ssh/sshd_config", 1<<20)
+func kernelControlsUnavailableError(paths []string) *protocol.StructuredError {
+	return &protocol.StructuredError{
+		Kind: protocol.ErrorGeneral, Code: "local_probe_failed",
+		Message: "Required kernel controls are unavailable",
+		Details: map[string]any{"paths": append([]string(nil), paths...)},
+	}
+}
+
+func sshPostureCheck(ctx context.Context, local probe.Local) checkOutcome {
+	output, err := local.Run(ctx, probe.Command{
+		Program: "sshd",
+		Arguments: []string{
+			"-T", "-C", "user=root,host=localhost,addr=127.0.0.1",
+		},
+		StdoutLimit: 64 << 10,
+		StderrLimit: 64 << 10,
+	})
 	if err != nil {
-		return localInspectionError("ssh-posture", "OpenSSH server configuration is unavailable")
+		return unavailableCheck("ssh-posture", "sshd", err)
+	}
+	if output.ExitCode != 0 {
+		return unavailableCheck(
+			"ssh-posture",
+			"sshd",
+			errors.New("sshd returned a nonzero exit code"),
+		)
 	}
 	values := map[string]string{}
-	for _, raw := range strings.Split(string(encoded), "\n") {
-		line := strings.TrimSpace(strings.SplitN(raw, "#", 2)[0])
+	for _, raw := range strings.Split(string(output.Stdout), "\n") {
+		line := strings.TrimSpace(raw)
 		fields := strings.Fields(line)
 		if len(fields) >= 2 {
 			values[strings.ToLower(fields[0])] = strings.ToLower(fields[1])

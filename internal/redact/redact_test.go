@@ -52,3 +52,37 @@ func TestValueRedactsTypedNestedContainersWithoutChangingTheirTypes(t *testing.T
 		t.Fatalf("Value mutated input: %#v", input)
 	}
 }
+
+func TestValueRecursivelyRedactsTypedStructsWithoutChangingTheirTypes(t *testing.T) {
+	type credentials struct {
+		Password string `json:"password"`
+	}
+	type record struct {
+		Name        string
+		Endpoint    string
+		Credentials *credentials
+	}
+	input := []record{{
+		Name:     "first",
+		Endpoint: "https://example.test/path?access_token=endpoint-secret",
+		Credentials: &credentials{
+			Password: "nested-secret",
+		},
+	}}
+
+	got := Value(input).([]record)
+
+	if got[0].Name != "first" {
+		t.Fatalf("safe field changed: %#v", got)
+	}
+	if strings.Contains(got[0].Endpoint, "endpoint-secret") ||
+		got[0].Credentials.Password != Mask {
+		t.Fatalf("typed struct secrets were not redacted: %#v", got)
+	}
+	if got[0].Credentials == input[0].Credentials {
+		t.Fatalf("typed struct pointer aliases input: %#v", got)
+	}
+	if input[0].Credentials.Password != "nested-secret" {
+		t.Fatalf("Value mutated input: %#v", input)
+	}
+}

@@ -82,6 +82,30 @@ func redactValue(value reflect.Value) reflect.Value {
 			output.Index(index).Set(redactValue(value.Index(index)))
 		}
 		return output
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		output := reflect.New(value.Type().Elem())
+		output.Elem().Set(redactValue(value.Elem()))
+		return output
+	case reflect.Struct:
+		output := reflect.New(value.Type()).Elem()
+		output.Set(value)
+		for index := range value.NumField() {
+			field := value.Type().Field(index)
+			if field.PkgPath != "" {
+				continue
+			}
+			item := value.Field(index)
+			if sensitiveStructField(field) {
+				item = maskedValue(item)
+			} else {
+				item = redactValue(item)
+			}
+			output.Field(index).Set(item)
+		}
+		return output
 	default:
 		return value
 	}
@@ -137,4 +161,12 @@ func sensitiveKey(key string) bool {
 		}
 	}
 	return false
+}
+
+func sensitiveStructField(field reflect.StructField) bool {
+	if sensitiveKey(field.Name) {
+		return true
+	}
+	jsonName := strings.SplitN(field.Tag.Get("json"), ",", 2)[0]
+	return jsonName != "" && jsonName != "-" && sensitiveKey(jsonName)
 }

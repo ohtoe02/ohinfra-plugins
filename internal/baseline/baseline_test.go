@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ohtoe02/ohtools-plugins/internal/execx"
+	"github.com/ohtoe02/ohtools-plugins/internal/probe"
 	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
 )
 
@@ -89,6 +90,10 @@ func TestCheckRunsCompiledLocalChecksInStableOrder(t *testing.T) {
 			return execx.Output{Stdout: []byte("yes\n")}, nil
 		case "systemctl":
 			return execx.Output{Stdout: []byte("active\n")}, nil
+		case "sshd":
+			return execx.Output{
+				Stdout: []byte("permitrootlogin prohibit-password\npasswordauthentication no\n"),
+			}, nil
 		default:
 			return execx.Output{}, execx.ErrNotFound
 		}
@@ -136,6 +141,150 @@ func TestCheckIsPartialWhenOptionalToolsAreMissing(t *testing.T) {
 	}
 	if len(result.Errors) == 0 {
 		t.Fatalf("partial result has no structured errors: %#v", result)
+	}
+}
+
+func TestKernelControlsAggregateMixedFindingsInStableOrder(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeBaselineFile(t, root, "proc/sys/net/ipv4/conf/all/rp_filter", "0\n")
+
+	first := kernelControlsCheck(probe.Local{Root: root})
+	second := kernelControlsCheck(probe.Local{Root: root})
+
+	for _, outcome := range []checkOutcome{first, second} {
+		if outcome.check.Status != protocol.StatusWarning {
+			t.Fatalf("check status = %s, want warning: %#v", outcome.check.Status, outcome)
+		}
+		if outcome.err == nil || outcome.err.Code != "local_probe_failed" {
+			t.Fatalf("mixed unavailable control has no structured error: %#v", outcome)
+		}
+		want := []map[string]any{
+			{
+				"path":   "proc/sys/kernel/randomize_va_space",
+				"status": "unavailable",
+			},
+			{
+				"path":     "proc/sys/net/ipv4/conf/all/rp_filter",
+				"status":   "mismatch",
+				"expected": "1",
+				"actual":   "0",
+			},
+		}
+		if got := outcome.check.Details["findings"]; !reflect.DeepEqual(got, want) {
+			t.Fatalf("kernel findings = %#v, want %#v", got, want)
+		}
+	}
+	if !reflect.DeepEqual(first.check, second.check) ||
+		!reflect.DeepEqual(first.err, second.err) {
+		t.Fatalf("kernel aggregation is unstable:\nfirst  %#v\nsecond %#v", first, second)
+	}
+}
+
+func TestSSHPostureUsesFixedEffectiveGlobalContext(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeBaselineFile(t, root, "etc/ssh/sshd_config", `
+Match User deploy
+    PermitRootLogin no
+    PasswordAuthentication no
+`)
+	var got execx.Spec
+	local := probe.Local{
+		Root: root,
+		Runner: execx.RunnerFunc(func(_ context.Context, spec execx.Spec) (execx.Output, error) {
+			got = spec
+			return execx.Output{
+				Stdout: []byte("permitrootlogin yes\npasswordauthentication yes\n"),
+			}, nil
+		}),
+	}
+
+	outcome := sshPostureCheck(context.Background(), local)
+
+	wantArguments := []string{
+		"-T", "-C", "user=root,host=localhost,addr=127.0.0.1",
+	}
+	if got.Program != "sshd" || !reflect.DeepEqual(got.Arguments, wantArguments) {
+		t.Fatalf("sshd probe = %#v, want sshd %#v", got, wantArguments)
+	}
+	if outcome.check.Status != protocol.StatusWarning || outcome.err != nil {
+		t.Fatalf("effective insecure posture = %#v, want warning without probe error", outcome)
+	}
+}
+
+func TestSSHPostureReportsMissingSSHDAsStructuredPartial(t *testing.T) {
+	t.Parallel()
+
+	outcome := sshPostureCheck(context.Background(), probe.Local{
+		Root: t.TempDir(),
+		Runner: execx.RunnerFunc(func(context.Context, execx.Spec) (execx.Output, error) {
+			return execx.Output{}, execx.ErrNotFound
+		}),
+	})
+
+	if outcome.check.Status != protocol.StatusSkipped {
+		t.Fatalf("check status = %s, want skipped: %#v", outcome.check.Status, outcome)
+	}
+	if outcome.err == nil ||
+		outcome.err.Kind != protocol.ErrorDependency ||
+		outcome.err.Code != "missing_dependency" ||
+		outcome.err.Dependency != "sshd" {
+		t.Fatalf("missing sshd error = %#v", outcome.err)
+	}
+}
+
+func TestTimeSyncDistinguishesProbeFailureFromUnsynchronizedClock(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		output     execx.Output
+		wantStatus protocol.Status
+		wantError  bool
+	}{
+		{
+			name: "nonzero exit is incomplete",
+			output: execx.Output{
+				ExitCode: 1,
+				Stderr:   []byte("timedatectl failed"),
+			},
+			wantStatus: protocol.StatusSkipped,
+			wantError:  true,
+		},
+		{
+			name:       "exit zero no is a warning",
+			output:     execx.Output{Stdout: []byte("no\n")},
+			wantStatus: protocol.StatusWarning,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			outcome := timeSyncCheck(context.Background(), probe.Local{
+				Root: t.TempDir(),
+				Runner: execx.RunnerFunc(
+					func(context.Context, execx.Spec) (execx.Output, error) {
+						return test.output, nil
+					},
+				),
+			})
+			if outcome.check.Status != test.wantStatus {
+				t.Fatalf("status = %s, want %s: %#v",
+					outcome.check.Status, test.wantStatus, outcome)
+			}
+			if (outcome.err != nil) != test.wantError {
+				t.Fatalf("structured error = %#v, wantError %t", outcome.err, test.wantError)
+			}
+			if test.wantError &&
+				(outcome.err.Code != "baseline_probe_failed" ||
+					outcome.err.Dependency != "timedatectl") {
+				t.Fatalf("structured error = %#v", outcome.err)
+			}
+		})
 	}
 }
 

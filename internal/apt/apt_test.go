@@ -89,6 +89,52 @@ Components: main
 	}
 }
 
+func TestSourcesRemoveCredentialBearingQueryAndFragment(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFixture(t, root, "etc/apt/sources.list", `
+deb https://alice:source-secret@example.com/debian?access_token=query-secret bookworm main
+`)
+	writeFixture(t, root, "etc/apt/sources.list.d/vendor.sources", `
+Types: deb
+URIs: https://packages.example/repository?api_key=deb822-secret#private-fragment
+Suites: stable
+Components: main
+`)
+
+	result, err := executeTest(t, Options{Root: root}, invocation("apt", "sources"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	for _, secret := range []string{
+		"alice",
+		"source-secret",
+		"access_token",
+		"query-secret",
+		"private-fragment",
+		"api_key",
+		"deb822-secret",
+	} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("source result leaks %q: %s", secret, text)
+		}
+	}
+	for _, safeURL := range []string{
+		"https://example.com/debian",
+		"https://packages.example/repository",
+	} {
+		if !strings.Contains(text, safeURL) {
+			t.Fatalf("source result omitted %q: %s", safeURL, text)
+		}
+	}
+}
+
 func TestUpdatesUsesOnlyFixedLocalSimulationArgv(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "http://proxy-user:proxy-secret@attacker.invalid")
 	t.Setenv("HTTPS_PROXY", "http://proxy-user:proxy-secret@attacker.invalid")
