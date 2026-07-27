@@ -27,8 +27,10 @@ do not alter operator-facing CLI paths: `docker-base`, for example, provides
 | `kafka-base` | `kafka` | Local installation, configuration, and storage diagnostics | `1.0.0 planned` |
 | `gitlab-runner-base` | `gitlab-runner` | Local service, safe configuration, and executor diagnostics | `1.0.0 planned` |
 | `monitoring-base` | `monitoring` | Local monitoring product inventory and configuration metadata | `1.0.0 planned` |
+| `backup-base` | `backup` | Local backup tool, schedule, and sanitized history diagnostics | `1.0.0 planned` |
+| `incident-base` | `incident` | Bounded local incident snapshots, services, and timeline metadata | `1.0.0 planned` |
+| `runbook-base` | `runbook` | Strict local documentation-only runbook discovery and validation | `1.0.0 planned` |
 
-The roadmap also reserves `backup-base`, `incident-base`, and `runbook-base`.
 `inventory-base` remains deferred. A package is not published to the catalog
 until it has a complete implementation, security tests, and immutable release
 assets.
