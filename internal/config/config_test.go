@@ -43,6 +43,24 @@ func TestLoadUsesStrictSingleDocumentYAML(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsConfigLargerThanOneMiBBeforeReading(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "oversized.yaml")
+	body := "warning: 80\n" + strings.Repeat("# padding\n", 1<<17)
+	if len(body) <= 1<<20 {
+		t.Fatalf("test fixture is only %d bytes", len(body))
+	}
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(path, fixture{})
+	if err == nil || !strings.Contains(err.Error(), "exceeds 1048576-byte limit") {
+		t.Fatalf("oversized config error = %v", err)
+	}
+}
+
 func TestLoadRejectsSymlinkAndWritableFile(t *testing.T) {
 	t.Parallel()
 
