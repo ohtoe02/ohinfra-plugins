@@ -21,14 +21,17 @@ do not alter operator-facing CLI paths: `docker-base`, for example, provides
 | `security-base` | `security` | Local account, SSH, firewall, and aggregate audit diagnostics | `1.0.0 planned` |
 | `apt-base` | `apt` | Local package state, upgrade simulation, sources, and history | `1.0.0 planned` |
 | `baseline-base` | `baseline` | Compiled local profile inspection and evaluation | `1.0.0 planned` |
+| `postgres-base` | `postgres` | Local installation, cluster, and configuration diagnostics | `1.0.0 planned` |
+| `k8s-base` | `k8s` | Local client, kubelet, kubeconfig, and static manifest diagnostics | `1.0.0 planned` |
+| `java-base` | `java` | Local runtime, process, and bounded `jcmd` diagnostics | `1.0.0 planned` |
 
-The roadmap also reserves `postgres-base`, `k8s-base`, `java-base`,
-`kafka-base`, `gitlab-runner-base`, `monitoring-base`, `backup-base`,
-`incident-base`, and `runbook-base`. `inventory-base` remains deferred. A
-package is not published to the catalog until it has a complete implementation,
-security tests, and immutable release assets.
+The roadmap also reserves `kafka-base`, `gitlab-runner-base`,
+`monitoring-base`, `backup-base`, `incident-base`, and `runbook-base`.
+`inventory-base` remains deferred. A package is not published to the catalog
+until it has a complete implementation, security tests, and immutable release
+assets.
 
-The new Wave 1 plugins are local-only. Network endpoints, credentials, remote
+The new plugins are local-only. Network endpoints, credentials, remote
 orchestration, and package downloads remain documented TODOs under
 [`docs/roadmap`](docs/roadmap).
 
