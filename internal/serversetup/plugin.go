@@ -12,6 +12,7 @@ import (
 	"github.com/ohtoe02/ohtools-plugins/internal/execx"
 	"github.com/ohtoe02/ohtools-plugins/internal/platform"
 	"github.com/ohtoe02/ohtools-plugins/internal/protocol"
+	"github.com/ohtoe02/ohtools-plugins/internal/redact"
 	"github.com/ohtoe02/ohtools-plugins/internal/resultbuilder"
 )
 
@@ -22,15 +23,19 @@ const (
 )
 
 type Options struct {
-	Version    string
-	Commit     string
-	BuildDate  string
-	ConfigPath string
-	Host       string
-	Root       string
-	Runner     execx.Runner
-	Now        func() time.Time
-	Identity   FileIdentityReader
+	Version          string
+	Commit           string
+	BuildDate        string
+	ConfigPath       string
+	Host             string
+	Root             string
+	Runner           execx.Runner
+	Now              func() time.Time
+	Identity         FileIdentityReader
+	Transactions     SetupTransactionFactory
+	MutationFiles    MutationFileAdapter
+	MutationCommands MutationCommandAdapter
+	UpgradeProbe     CachedUpgradeProbe
 }
 
 func NewDefinition(options Options) protocol.Definition {
@@ -48,6 +53,18 @@ func NewDefinition(options Options) protocol.Definition {
 	}
 	if options.Now == nil {
 		options.Now = time.Now
+	}
+	if options.Transactions == nil {
+		commands := options.MutationCommands
+		if commands == nil {
+			commands = localMutationCommands{Runner: options.Runner}
+		}
+		options.Transactions = localSetupTransactionFactory{
+			files: options.MutationFiles, commands: commands,
+		}
+	}
+	if options.UpgradeProbe == nil {
+		options.UpgradeProbe = localCachedUpgradeProbe{Runner: options.Runner}
 	}
 
 	commands := []protocol.Command{
@@ -83,17 +100,82 @@ func NewDefinition(options Options) protocol.Definition {
 	return protocol.Definition{
 		Manifest: manifest,
 		Plan: func(ctx context.Context, invocation protocol.Invocation) (protocol.Plan, error) {
-			if !slices.Equal(invocation.CommandPath, []string{"setup", "check"}) {
-				return protocol.Plan{}, argumentError(
-					"setup apply and setup upgrade planning is provided by the mutation module",
-				)
+			if slices.Equal(invocation.CommandPath, []string{"setup", "check"}) {
+				return protocol.ReadOnlyPlan(ctx, invocation, manifest)
 			}
-			return protocol.ReadOnlyPlan(ctx, invocation, manifest)
+			return buildCurrentPlan(ctx, invocation, options, manifest)
 		},
 		Execute: func(ctx context.Context, invocation protocol.Invocation) (protocol.Result, error) {
 			return execute(ctx, invocation, options, manifest)
 		},
 	}
+}
+
+func buildCurrentPlan(
+	ctx context.Context,
+	invocation protocol.Invocation,
+	options Options,
+	manifest protocol.Manifest,
+) (protocol.Plan, error) {
+	if _, err := protocol.ReadOnlyPlan(ctx, invocation, manifest); err != nil {
+		return protocol.Plan{}, err
+	}
+	mode, err := planModeForPath(invocation.CommandPath)
+	if err != nil {
+		return protocol.Plan{}, err
+	}
+	settings, profile, err := loadSetupState(options)
+	if err != nil {
+		return protocol.Plan{}, err
+	}
+	current, err := Checker{
+		Root: options.Root, Runner: options.Runner, Host: options.Host,
+		Now: options.Now, Tool: tool(options), Identity: options.Identity,
+	}.Run(ctx, profile, settings)
+	if err != nil {
+		return protocol.Plan{}, err
+	}
+	cachedUpgrades := []string{}
+	if mode == PlanUpgrade {
+		cachedUpgrades, err = options.UpgradeProbe.CachedUpgrades(ctx, profile.Packages)
+		if err != nil {
+			code := protocol.ExitGeneral
+			if errors.Is(err, execx.ErrNotFound) {
+				code = protocol.ExitDependency
+			}
+			return protocol.Plan{}, protocol.ExitError{
+				Code: code,
+				Err:  errors.New(redact.String("inspect cached upgrades: " + err.Error())),
+			}
+		}
+	}
+	return BuildSetupPlan(PlanInput{
+		Mode: mode, Profile: profile, Checks: current.Checks,
+		CachedUpgrades: cachedUpgrades,
+	})
+}
+
+func loadSetupState(options Options) (Config, Profile, error) {
+	settings, err := LoadConfig(options.ConfigPath)
+	if err != nil {
+		return Config{}, Profile{}, protocol.ExitError{
+			Code: protocol.ExitConfiguration, Err: err,
+		}
+	}
+	detected, err := platform.Detect(options.Root)
+	if err != nil {
+		return Config{}, Profile{}, protocol.ExitError{
+			Code: protocol.ExitConfiguration,
+			Err:  errors.New("detect setup platform: " + err.Error()),
+		}
+	}
+	profile, err := ResolveProfile(settings, detected)
+	if err != nil {
+		return Config{}, Profile{}, protocol.ExitError{
+			Code: protocol.ExitConfiguration, Err: err,
+		}
+	}
+	return settings, profile, nil
 }
 
 func execute(
@@ -103,9 +185,7 @@ func execute(
 	manifest protocol.Manifest,
 ) (protocol.Result, error) {
 	if !slices.Equal(invocation.CommandPath, []string{"setup", "check"}) {
-		return protocol.Result{}, argumentError(
-			"setup apply and setup upgrade execution is provided by the mutation module",
-		)
+		return executeMutation(ctx, invocation, options, manifest)
 	}
 	if _, err := protocol.ReadOnlyPlan(ctx, invocation, manifest); err != nil {
 		return protocol.Result{}, err
