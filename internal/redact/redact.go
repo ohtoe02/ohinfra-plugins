@@ -1,6 +1,7 @@
 package redact
 
 import (
+	"reflect"
 	"regexp"
 	"strings"
 
@@ -27,43 +28,101 @@ func String(value string) string {
 }
 
 func Value(value any) any {
-	switch typed := value.(type) {
-	case string:
-		return String(typed)
-	case map[string]any:
-		output := make(map[string]any, len(typed))
-		for key, item := range typed {
-			if sensitiveKey(key) {
-				output[key] = Mask
+	output := redactValue(reflect.ValueOf(value))
+	if !output.IsValid() {
+		return nil
+	}
+	return output.Interface()
+}
+
+func redactValue(value reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return reflect.Value{}
+	}
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		output := reflect.New(value.Type()).Elem()
+		output.Set(redactValue(value.Elem()))
+		return output
+	case reflect.String:
+		output := reflect.New(value.Type()).Elem()
+		output.SetString(String(value.String()))
+		return output
+	case reflect.Map:
+		if value.IsNil() || value.Type().Key().Kind() != reflect.String {
+			return value
+		}
+		output := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iterator := value.MapRange()
+		for iterator.Next() {
+			item := iterator.Value()
+			if sensitiveKey(iterator.Key().String()) {
+				item = maskedValue(item)
 			} else {
-				output[key] = Value(item)
+				item = redactValue(item)
 			}
+			output.SetMapIndex(iterator.Key(), item)
 		}
 		return output
-	case map[string]string:
-		output := make(map[string]string, len(typed))
-		for key, item := range typed {
-			if sensitiveKey(key) {
-				output[key] = Mask
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		output := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for index := range value.Len() {
+			output.Index(index).Set(redactValue(value.Index(index)))
+		}
+		return output
+	case reflect.Array:
+		output := reflect.New(value.Type()).Elem()
+		for index := range value.Len() {
+			output.Index(index).Set(redactValue(value.Index(index)))
+		}
+		return output
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		output := reflect.New(value.Type().Elem())
+		output.Elem().Set(redactValue(value.Elem()))
+		return output
+	case reflect.Struct:
+		output := reflect.New(value.Type()).Elem()
+		output.Set(value)
+		for index := range value.NumField() {
+			field := value.Type().Field(index)
+			if field.PkgPath != "" {
+				continue
+			}
+			item := value.Field(index)
+			if sensitiveStructField(field) {
+				item = maskedValue(item)
 			} else {
-				output[key] = String(item)
+				item = redactValue(item)
 			}
-		}
-		return output
-	case []any:
-		output := make([]any, len(typed))
-		for index, item := range typed {
-			output[index] = Value(item)
-		}
-		return output
-	case []string:
-		output := make([]string, len(typed))
-		for index, item := range typed {
-			output[index] = String(item)
+			output.Field(index).Set(item)
 		}
 		return output
 	default:
 		return value
+	}
+}
+
+func maskedValue(value reflect.Value) reflect.Value {
+	switch value.Kind() {
+	case reflect.Interface:
+		output := reflect.New(value.Type()).Elem()
+		output.Set(reflect.ValueOf(Mask))
+		return output
+	case reflect.String:
+		output := reflect.New(value.Type()).Elem()
+		output.SetString(Mask)
+		return output
+	default:
+		return reflect.Zero(value.Type())
 	}
 }
 
@@ -102,4 +161,12 @@ func sensitiveKey(key string) bool {
 		}
 	}
 	return false
+}
+
+func sensitiveStructField(field reflect.StructField) bool {
+	if sensitiveKey(field.Name) {
+		return true
+	}
+	jsonName := strings.SplitN(field.Tag.Get("json"), ",", 2)[0]
+	return jsonName != "" && jsonName != "-" && sensitiveKey(jsonName)
 }

@@ -27,7 +27,25 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        plugin: [system-base, storage-base, systemd-base, docker-base]
+        plugin:
+          - system-base
+          - storage-base
+          - systemd-base
+          - docker-base
+          - server-setup-base
+          - network-base
+          - security-base
+          - apt-base
+          - baseline-base
+          - postgres-base
+          - k8s-base
+          - java-base
+          - kafka-base
+          - gitlab-runner-base
+          - monitoring-base
+          - backup-base
+          - incident-base
+          - runbook-base
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5

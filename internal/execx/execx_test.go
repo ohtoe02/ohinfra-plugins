@@ -17,11 +17,22 @@ func TestMain(m *testing.M) {
 		_, _ = os.Stdout.WriteString(strings.Repeat("o", 128))
 		_, _ = os.Stderr.WriteString(strings.Repeat("e", 128))
 		os.Exit(0)
+	case "marker":
+		_ = os.WriteFile(os.Getenv("EXECX_MARKER"), []byte("started"), 0o600)
+		os.Exit(0)
 	case "sleep":
 		time.Sleep(5 * time.Second)
 		os.Exit(0)
 	case "exit":
 		os.Exit(23)
+	case "cwd":
+		current, err := os.Getwd()
+		if err != nil {
+			_, _ = os.Stderr.WriteString(err.Error())
+			os.Exit(1)
+		}
+		_, _ = os.Stdout.WriteString(current)
+		os.Exit(0)
 	}
 	os.Exit(m.Run())
 }
@@ -90,6 +101,56 @@ func TestRunnerStopsAtDeadlineAndReportsNonZeroExit(t *testing.T) {
 	})
 	if err != nil || output.ExitCode != 23 {
 		t.Fatalf("non-zero error=%v output=%#v", err, output)
+	}
+}
+
+func TestRunnerDoesNotStartProcessWhenContextIsAlreadyCanceled(t *testing.T) {
+	program := copyTestExecutable(t)
+	runner := OSRunner{Resolver: Resolver{Directories: []string{filepath.Dir(program)}}}
+	marker := filepath.Join(t.TempDir(), "started")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	output, err := runner.Run(ctx, Spec{
+		Program: filepath.Base(program),
+		Environment: map[string]string{
+			"GO_WANT_EXECX_HELPER": "marker",
+			"EXECX_MARKER":         marker,
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+	if output.Path != "" {
+		t.Fatalf("Run() resolved and started process despite canceled context: %#v", output)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("process started despite canceled context: stat error = %v", err)
+	}
+}
+
+func TestRunnerUsesTrustedWorkingDirectoryInsteadOfCallerCWD(t *testing.T) {
+	program := copyTestExecutable(t)
+	poisoned := t.TempDir()
+	t.Chdir(poisoned)
+
+	runner := OSRunner{Resolver: Resolver{Directories: []string{filepath.Dir(program)}}}
+	output, err := runner.Run(context.Background(), Spec{
+		Program: filepath.Base(program),
+		Environment: map[string]string{
+			"GO_WANT_EXECX_HELPER": "cwd",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(string(output.Stdout))
+	want := filepath.VolumeName(program) + string(filepath.Separator)
+	if got != want {
+		t.Fatalf("child working directory = %q, want trusted directory %q (caller cwd %q)", got, want, poisoned)
+	}
+	if got == poisoned {
+		t.Fatalf("child inherited poisoned caller working directory %q", poisoned)
 	}
 }
 

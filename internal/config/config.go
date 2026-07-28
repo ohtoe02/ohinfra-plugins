@@ -10,6 +10,9 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
+// maxConfigBytes bounds trusted plugin configuration before it is read into memory.
+const maxConfigBytes int64 = 1 << 20
+
 func Load[T any](path string, defaults T) (T, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -23,6 +26,9 @@ func Load[T any](path string, defaults T) (T, error) {
 	}
 	if !info.Mode().IsRegular() {
 		return defaults, errors.New("plugin config must be a regular file")
+	}
+	if info.Size() > maxConfigBytes {
+		return defaults, fmt.Errorf("plugin config exceeds %d-byte limit", maxConfigBytes)
 	}
 	if err := validateTrustedFile(path, info); err != nil {
 		return defaults, err

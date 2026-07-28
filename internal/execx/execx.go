@@ -104,6 +104,9 @@ type OSRunner struct {
 }
 
 func (runner OSRunner) Run(ctx context.Context, spec Spec) (Output, error) {
+	if err := ctx.Err(); err != nil {
+		return Output{}, err
+	}
 	path, err := runner.Resolver.Resolve(spec.Program)
 	if err != nil {
 		return Output{}, err
@@ -117,6 +120,7 @@ func (runner OSRunner) Run(ctx context.Context, spec Spec) (Output, error) {
 	command.Stdout = stdout
 	command.Stderr = stderr
 	command.Env = stableEnvironment(spec.Environment)
+	command.Dir = trustedWorkingDirectory(path)
 	prepareCommand(command)
 
 	started := time.Now()
@@ -141,6 +145,10 @@ func (runner OSRunner) Run(ctx context.Context, spec Spec) (Output, error) {
 		output.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
 		return output, ctx.Err()
 	}
+}
+
+func trustedWorkingDirectory(executablePath string) string {
+	return filepath.VolumeName(executablePath) + string(filepath.Separator)
 }
 
 func buildOutput(

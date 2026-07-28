@@ -8,21 +8,36 @@ Plugin package names are visible in the catalog and management commands. They
 do not alter operator-facing CLI paths: `docker-base`, for example, provides
 `ohtools docker ...` and `ohtools compose ...`.
 
-## Production plugins
+## Implemented plugins
 
-| Package | CLI namespaces | Current commands |
-| --- | --- | --- |
-| `system-base` | `system`, `performance` | `system info`, `system health` |
-| `storage-base` | `disk` | `disk usage [path]` |
-| `systemd-base` | `service`, `logs` | `service status`, `service logs`, `service restart` |
-| `docker-base` | `docker`, `compose` | Docker diagnostics and the read-only Compose baseline |
+| Package | CLI namespaces | Current commands | Release |
+| --- | --- | --- | --- |
+| `system-base` | `system` | `system info`, `system health` | `1.0.1` |
+| `storage-base` | `disk` | `disk usage [path]` | `1.0.1` |
+| `systemd-base` | `service` | `service status`, `service logs`, `service restart` | `1.0.1` |
+| `docker-base` | `docker`, `compose` | Docker diagnostics and the read-only Compose baseline | `1.0.1` |
+| `server-setup-base` | `setup` | `setup check`, `setup apply`, `setup upgrade` | `1.0.0 planned` |
+| `network-base` | `network`, `tls` | Local network inventory and TLS file inspection | `1.0.0 planned` |
+| `security-base` | `security` | Local account, SSH, firewall, and aggregate audit diagnostics | `1.0.0 planned` |
+| `apt-base` | `apt` | Local package state, upgrade simulation, sources, and history | `1.0.0 planned` |
+| `baseline-base` | `baseline` | Compiled local profile inspection and evaluation | `1.0.0 planned` |
+| `postgres-base` | `postgres` | Local installation, cluster, and configuration diagnostics | `1.0.0 planned` |
+| `k8s-base` | `k8s` | Local client, kubelet, kubeconfig, and static manifest diagnostics | `1.0.0 planned` |
+| `java-base` | `java` | Local runtime, process, and bounded `jcmd` diagnostics | `1.0.0 planned` |
+| `kafka-base` | `kafka` | Local installation, configuration, and storage diagnostics | `1.0.0 planned` |
+| `gitlab-runner-base` | `gitlab-runner` | Local service, safe configuration, and executor diagnostics | `1.0.0 planned` |
+| `monitoring-base` | `monitoring` | Local monitoring product inventory and configuration metadata | `1.0.0 planned` |
+| `backup-base` | `backup` | Local backup tool, schedule, and sanitized history diagnostics | `1.0.0 planned` |
+| `incident-base` | `incident` | Bounded local incident snapshots, services, and timeline metadata | `1.0.0 planned` |
+| `runbook-base` | `runbook` | Strict local documentation-only runbook discovery and validation | `1.0.0 planned` |
 
-The roadmap also reserves `network-base`, `postgres-base`, `k8s-base`,
-`security-base`, `apt-base`, `java-base`, `kafka-base`,
-`gitlab-runner-base`, `monitoring-base`, `backup-base`, `baseline-base`,
-`incident-base`, and `runbook-base`. A reserved package is not published to the
-catalog until it has a complete implementation, security tests, and immutable
-release assets.
+`inventory-base` remains deferred. A package is not published to the catalog
+until it has a complete implementation, security tests, and immutable release
+assets.
+
+The new plugins are local-only. Network endpoints, credentials, remote
+orchestration, and package downloads remain documented TODOs under
+[`docs/roadmap`](docs/roadmap).
 
 ## Build and test
 
