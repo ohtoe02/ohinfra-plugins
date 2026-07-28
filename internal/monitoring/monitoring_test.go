@@ -401,6 +401,25 @@ func TestInventoryRejectsSymlinkedAndOversizedProcInventories(t *testing.T) {
 		return execx.Output{Stdout: []byte("LoadState=not-found\n")}, nil
 	})
 
+	t.Run("non-directory root", func(t *testing.T) {
+		t.Parallel()
+
+		root := filepath.Join(t.TempDir(), "root")
+		if err := os.WriteFile(root, []byte("not a directory"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		definition := NewDefinition(Options{Root: root, Runner: safeRunner})
+		result, err := definition.Execute(
+			context.Background(), invocation("monitoring", "inventory"),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !hasErrorCode(result, "process_inventory") {
+			t.Fatalf("result = %#v, want partial process inventory", result)
+		}
+	})
+
 	t.Run("symlinked proc", func(t *testing.T) {
 		t.Parallel()
 

@@ -285,11 +285,11 @@ func monitoringProcesses(ctx context.Context, local probe.Local) (map[string]int
 		return nil, err
 	}
 	exists, err := local.Exists("proc")
-	if errors.Is(err, os.ErrNotExist) || !exists {
-		return map[string]int{}, nil
-	}
 	if err != nil {
 		return map[string]int{}, err
+	}
+	if !exists {
+		return map[string]int{}, nil
 	}
 	procPath := filepath.Join(local.Root, "proc")
 	before, err := os.Lstat(procPath)
