@@ -90,6 +90,13 @@ var russianHeadings = map[string]string{
 	"Compatibility and source":        "Совместимость и исходный код",
 }
 
+var hostReplacementPlugins = map[string]struct{}{
+	"docker-base":  {},
+	"storage-base": {},
+	"system-base":  {},
+	"systemd-base": {},
+}
+
 func ParseDocument(name string, data []byte) (Document, error) {
 	frontmatter, markdown, err := splitFrontmatter(data)
 	if err != nil {
@@ -158,6 +165,10 @@ func ValidateSet(documents []Document, manifests map[string][]string) error {
 		if english.LocalOnly != russian.LocalOnly {
 			return fmt.Errorf("local_only mismatch for %q", pluginID)
 		}
+		_, isHostReplacement := hostReplacementPlugins[pluginID]
+		if english.LocalOnly == isHostReplacement {
+			return fmt.Errorf("invalid local_only classification for %q: got %t, want %t", pluginID, english.LocalOnly, !isHostReplacement)
+		}
 		if err := compareCommands(pluginID, english.CommandPaths, manifests[pluginID]); err != nil {
 			return err
 		}
@@ -166,6 +177,31 @@ func ValidateSet(documents []Document, manifests map[string][]string) error {
 		}
 	}
 	return nil
+}
+
+func ValidatePublishedVersions(documents []Document, releaseTags []string) error {
+	published := make(map[string]struct{}, len(releaseTags))
+	for _, tag := range releaseTags {
+		published[tag] = struct{}{}
+	}
+
+	missing := make(map[string]struct{})
+	for _, document := range documents {
+		tag := document.PluginID + "-v" + document.DocumentedVersion
+		if _, ok := published[tag]; !ok {
+			missing[tag] = struct{}{}
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	tags := make([]string, 0, len(missing))
+	for tag := range missing {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	return fmt.Errorf("documented versions are not published release tags: %s", strings.Join(tags, ", "))
 }
 
 func LoadDirectory(root string) ([]Document, error) {

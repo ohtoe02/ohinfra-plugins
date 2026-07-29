@@ -88,6 +88,44 @@ func TestValidateSetRequiresLocaleParityAndManifestCoverage(t *testing.T) {
 	}
 }
 
+func TestValidateSetEnforcesPublishedLocalOnlyClassification(t *testing.T) {
+	input := strings.ReplaceAll(validEnglishDocument(), "server-setup-base", "system-base")
+	input = strings.ReplaceAll(input, "setup check", "system info")
+	input = strings.ReplaceAll(input, "  - setup apply\n", "")
+	input = strings.ReplaceAll(input, "  - setup upgrade\n", "")
+	english, err := ParseDocument("system-base.md", []byte(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	russianInput := strings.ReplaceAll(input, "locale: en", "locale: ru")
+	for englishHeading, russianHeading := range russianHeadings {
+		russianInput = strings.ReplaceAll(russianInput, "## "+englishHeading, "## "+russianHeading)
+	}
+	russian, err := ParseDocument("system-base.md", []byte(russianInput))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = ValidateSet([]Document{english, russian}, map[string][]string{
+		"system-base": {"system info"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "local_only") {
+		t.Fatalf("ValidateSet() error = %v, want local_only classification rejection", err)
+	}
+}
+
+func TestValidatePublishedVersionsRejectsMissingPluginReleaseTag(t *testing.T) {
+	english, err := ParseDocument("server-setup-base.md", []byte(validEnglishDocument()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = ValidatePublishedVersions([]Document{english}, []string{"server-setup-base-v0.9.0"})
+	if err == nil || !strings.Contains(err.Error(), "server-setup-base-v1.0.0") {
+		t.Fatalf("ValidatePublishedVersions() error = %v, want missing release tag", err)
+	}
+}
+
 func TestLoadDirectoryAndBuildBundleAreDeterministic(t *testing.T) {
 	root := t.TempDir()
 	for _, locale := range []string{"en", "ru"} {

@@ -19,6 +19,7 @@ import (
 func main() {
 	root := flag.String("root", ".", "repository root")
 	selected := flag.String("plugins", "", "comma-separated plugin IDs; defaults to every cmd/*-base")
+	verifyReleaseTags := flag.Bool("verify-release-tags", false, "require every documented version to have an immutable plugin release tag")
 	flag.Parse()
 
 	pluginIDs, err := discoverPlugins(*root, *selected)
@@ -68,6 +69,17 @@ func main() {
 
 	if err := plugindocs.ValidateSet(filtered, manifests); err != nil {
 		exit(err)
+	}
+	if *verifyReleaseTags {
+		command := exec.Command("git", "tag", "--list")
+		command.Dir = *root
+		output, err := command.Output()
+		if err != nil {
+			exit(fmt.Errorf("list plugin release tags: %w", err))
+		}
+		if err := plugindocs.ValidatePublishedVersions(filtered, strings.Fields(string(output))); err != nil {
+			exit(err)
+		}
 	}
 	fmt.Printf("validated %d localized documents for %d plugins\n", len(filtered), len(pluginIDs))
 }
