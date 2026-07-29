@@ -1,0 +1,47 @@
+name: documentation-release
+
+on:
+  push:
+    tags:
+      - "plugin-docs-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: documentation-production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.0"
+          cache: true
+      - name: Validate immutable release coordinates
+        shell: bash
+        run: |
+          [[ "${GITHUB_REF_NAME}" =~ ^plugin-docs-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch origin main
+          git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
+      - name: Test documentation contract
+        run: |
+          go test -race ./internal/documentation
+          go run ./tools/docscheck -verify-release-tags
+      - name: Build immutable documentation bundle
+        shell: bash
+        run: |
+          mkdir -p dist
+          go run ./tools/docbundle \
+            -source-commit "${GITHUB_SHA}" \
+            -output dist/plugin-docs-v1.json
+          sha256sum dist/plugin-docs-v1.json > dist/plugin-docs-v1.json.sha256
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/plugin-docs-v1.json
+            dist/plugin-docs-v1.json.sha256
