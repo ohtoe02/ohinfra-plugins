@@ -102,6 +102,13 @@ func ParseDocument(name string, data []byte) (Document, error) {
 	if err := decoder.Decode(&document); err != nil {
 		return Document{}, fmt.Errorf("%s: invalid frontmatter: %w", name, err)
 	}
+	var present map[string]yaml.Node
+	if err := yaml.Unmarshal(frontmatter, &present); err != nil {
+		return Document{}, fmt.Errorf("%s: invalid frontmatter: %w", name, err)
+	}
+	if _, ok := present["local_only"]; !ok {
+		return Document{}, fmt.Errorf("%s: frontmatter requires local_only", name)
+	}
 	document.Markdown = strings.TrimSpace(string(markdown)) + "\n"
 
 	if err := validateMetadata(name, document); err != nil {

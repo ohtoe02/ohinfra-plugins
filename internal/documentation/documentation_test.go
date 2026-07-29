@@ -34,6 +34,15 @@ func TestParseDocumentRejectsUnknownFrontmatterFields(t *testing.T) {
 	}
 }
 
+func TestParseDocumentRequiresExplicitLocalOnlyClassification(t *testing.T) {
+	input := strings.Replace(validEnglishDocument(), "local_only: true\n", "", 1)
+
+	_, err := ParseDocument("server-setup-base.md", []byte(input))
+	if err == nil || !strings.Contains(err.Error(), "local_only") {
+		t.Fatalf("ParseDocument() error = %v, want missing local_only rejection", err)
+	}
+}
+
 func TestParseDocumentRejectsUnsafeMarkdown(t *testing.T) {
 	inputs := map[string]string{
 		"raw HTML": strings.Replace(validEnglishDocument(), "Inspect the local host.", "<script>alert(1)</script>", 1),
